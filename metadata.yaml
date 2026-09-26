@@ -7,8 +7,8 @@ desc: >-
   管理员按美元配置单价与限额：可选用模型白名单、每人每天每模型限额、每人每天消费总额度、
   按模型每 bot 每日总池（各 bot 独立、不合并）；内置 OpenCode Go 价目与限额预设
   （单价自动换算、峰谷定价、每人每日额度按官方月额度 ÷60），每人每天另有消费总额度，
-  管理员默认免限额且不计数。超限自动拦截并提示。
-version: 1.4.0
+  管理员默认免限额且不计数。超限自动拦截并提示。另提供 /think 调整当前模型的思考强度。
+version: 1.5.0
 author: Galaxy1108
 repo: https://github.com/Galaxy1108/astrbot_plugin_model_quota
 astrbot_version: ">=4.5.7"

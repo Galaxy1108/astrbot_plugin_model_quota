@@ -23,6 +23,7 @@ import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -40,6 +41,16 @@ except Exception:  # pragma: no cover - 极旧版本回退为普通字符串
     GreedyStr = str  # type: ignore[assignment,misc]
 
 _USAGE_KEY = "daily_usage_v3"
+"""KV 存储中用量数据的键名（v3：按 bot 分池）。"""
+
+_THINK_KEY = "think_efforts_v1"
+"""KV 存储中「模型 -> 思考强度」的键名。"""
+
+THINK_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high")
+"""可选思考强度；off 映射为 API 的 none。"""
+
+THINK_OFF_VALUE = "none"
+"""off 对应写入 provider 的值。"""
 """KV 存储中用量数据的键名（v2：金额制）。"""
 
 _UNLIMITED = "不限"
@@ -114,6 +125,7 @@ _OPENCODE_GO_MONTHLY_LIMITS: dict[str, float] = {
     "deepseek-v4.1-flash": 60, "deepseek-v4-pro": 15, "deepseek-v4-flash": 30,
     "deepseek-v4-flash-vision-exp": 15, "hy4-preview": 30, "hy3": 60,
     "grok-4.7": 15, "grok-4.6": 15, "gpt-6-luna": 15, "gpt-5.6-luna": 15,
+    "space-bunny-free": 0,
 }
 """OpenCode Go 各模型的每月额度（美元），用于文档与月→日换算参考。"""
 
@@ -128,6 +140,30 @@ _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 
 _QUOTA_PRESET_DEFAULT_TOTAL = 2.0
 """限额预设下每人每天消费总额度（美元）。"""
+
+
+class QuotaRow(NamedTuple):
+    """额度卡片的一行。
+
+    Attributes:
+        label: 行标题（模型名或「个人总额」）。
+        percent: 已用百分比（0-100，进度条长度）。
+        limited: 是否已用完（决定进度条颜色与 ※ 标记）。
+        sub_left: 进度条下方左侧说明。
+        sub_right: 进度条下方右侧说明。
+        pool_percent: 总池已用百分比；None 表示该行没有总池条。
+        pool_sub: 总池说明（当前由 sub_left 承载，保留字段）。
+        thick: 是否使用加粗进度条（个人总额行使用）。
+    """
+
+    label: str
+    percent: float
+    limited: bool
+    sub_left: str
+    sub_right: str
+    pool_percent: float | None = None
+    pool_sub: str = ""
+    thick: bool = False
 
 # 进度条字形：与 opencode 用量插件（/ocgo）同款，GBK 安全。
 BAR_WIDTH = 10
@@ -245,6 +281,20 @@ class ModelQuotaPlugin(Star):
         if self.rate <= 0:
             self.rate = 7.2
         self.admin_exempt: bool = bool(cfg.get("admin_exempt", True))
+        # 思考强度
+        self.think_enabled: bool = bool(cfg.get("think_enabled", True))
+        self.think_admin_only: bool = bool(cfg.get("think_admin_only", True))
+        raw_levels = cfg.get("think_levels", list(THINK_LEVELS))
+        levels = (
+            [str(x).strip().lower() for x in raw_levels if str(x).strip()]
+            if isinstance(raw_levels, list)
+            else list(THINK_LEVELS)
+        )
+        self.think_levels: list[str] = levels or list(THINK_LEVELS)
+        self.default_think_effort: str = (
+            str(cfg.get("default_think_effort", "") or "").strip().lower()
+        )
+        self._think_efforts: dict[str, str] | None = None
         self.quota_render: str = (
             str(cfg.get("quota_render", "auto") or "auto").strip().lower()
         )
@@ -725,6 +775,9 @@ class ModelQuotaPlugin(Star):
         price = self.price_for(pid, model_name)
         disp = self._display_name(pid, model_name)
 
+        # 思考强度按模型生效，管理员也照常应用（放在豁免判断之前）
+        await self._apply_think_effort(provider, pid)
+
         if self.admin_exempt and event.is_admin():
             return  # 管理员免限额且不计数
 
@@ -781,6 +834,112 @@ class ModelQuotaPlugin(Star):
         await self._save_usage(data)
 
     # ------------------------------------------------------------------
+    # 思考强度（reasoning_effort）
+    #
+    # AstrBot 的 reasoning_effort 只能通过 provider 的 custom_extra_body 生效
+    # （text_chat 的 **kwargs 不会并入 payload），因此这里是「按模型」设置：
+    # 改的是该模型在当前 bot 上的推理强度，所有用户共用，不是按人隔离。
+    # ------------------------------------------------------------------
+
+    async def _load_think_efforts(self) -> dict[str, str]:
+        if self._think_efforts is None:
+            data = await self.get_kv_data(_THINK_KEY, None)
+            if not isinstance(data, dict):
+                data = {}
+            self._think_efforts = {
+                str(k): str(v).strip().lower()
+                for k, v in data.items()
+                if str(v).strip()
+            }
+        return self._think_efforts
+
+    async def _save_think_efforts(self) -> None:
+        await self.put_kv_data(_THINK_KEY, dict(self._think_efforts or {}))
+
+    @staticmethod
+    def _think_api_value(level: str) -> str:
+        """插件内的层级名 -> 写入 provider 的值。"""
+        return THINK_OFF_VALUE if level == "off" else level
+
+    async def think_effort_of(self, provider_id: str) -> str:
+        """该模型当前的思考强度；空串表示未设置（跟随 provider 自身配置）。"""
+        efforts = await self._load_think_efforts()
+        return efforts.get(provider_id, self.default_think_effort)
+
+    async def _apply_think_effort(self, provider: object, provider_id: str) -> None:
+        """把该模型的思考强度写进 provider 的 custom_extra_body。"""
+        if not self.think_enabled:
+            return
+        level = await self.think_effort_of(provider_id)
+        if not level:
+            return
+        config = getattr(provider, "provider_config", None)
+        if not isinstance(config, dict):
+            return
+        body = config.get("custom_extra_body")
+        if not isinstance(body, dict):
+            body = {}
+            config["custom_extra_body"] = body
+        value = self._think_api_value(level)
+        if body.get("reasoning_effort") != value:
+            body["reasoning_effort"] = value
+            logger.info(
+                f"model_quota: 已将模型 {provider_id} 的思考强度设为 {level}"
+                f"（reasoning_effort={value}）"
+            )
+
+    def _think_help(self, provider_id: str, model: str, current: str) -> str:
+        lines = [
+            f"🧠 思考强度：{self._display_name(provider_id, model)}",
+            f"当前：{current or '未设置（跟随模型服务自身配置）'}",
+            f"可选：{' / '.join(self.think_levels)} / reset",
+            f"用法：/think <级别>（例：/think high），/think reset 清除",
+        ]
+        if self.think_admin_only:
+            lines.append("该设置按模型生效（同模型的所有用户共用），仅管理员可改。")
+        else:
+            lines.append("该设置按模型生效，同模型的所有用户共用。")
+        return "\n".join(lines)
+
+    @filter.command("think", alias={"思考", "思考强度"})
+    async def think(self, event: AstrMessageEvent, action: str | None = None):
+        """查看或设置当前模型的思考强度。"""
+        if not self.think_enabled:
+            yield event.plain_result("思考强度功能已在插件配置中关闭。")
+            return
+        prov = await self._provider_of(event)
+        if prov is None:
+            yield event.plain_result("暂时拿不到当前模型，稍后再试。")
+            return
+        pid = prov.meta().id
+        model = prov.meta().model or ""
+        act = (action or "").strip().lower()
+        if not act:
+            current = await self.think_effort_of(pid)
+            yield event.plain_result(self._think_help(pid, model, current))
+            return
+        if self.think_admin_only and not event.is_admin():
+            yield event.plain_result("❌ 思考强度仅管理员可修改，你可以用 /think 查看当前值。")
+            return
+        efforts = await self._load_think_efforts()
+        disp = self._display_name(pid, model)
+        if act in ("reset", "clear", "默认", "重置"):
+            efforts.pop(pid, None)
+            await self._save_think_efforts()
+            await self._apply_think_effort(prov, pid)
+            yield event.plain_result(f"✅ 已清除 {disp} 的思考强度设置。")
+            return
+        if act not in self.think_levels:
+            yield event.plain_result(
+                f"❌ 不支持的级别「{act}」，可选：{' / '.join(self.think_levels)} / reset"
+            )
+            return
+        efforts[pid] = act
+        await self._save_think_efforts()
+        await self._apply_think_effort(prov, pid)
+        yield event.plain_result(f"✅ 已将 {disp} 的思考强度设为 {act}。")
+
+    # ------------------------------------------------------------------
     # /model 指令（群聊切换仅管理员）
     # ------------------------------------------------------------------
 
@@ -810,15 +969,19 @@ class ModelQuotaPlugin(Star):
             items = [it for it in items if it[0] in self.selectable_models]
         return items
 
-    async def _current_provider_id(self, event: AstrMessageEvent) -> str | None:
+    async def _provider_of(self, event: AstrMessageEvent):
+        """当前会话正在使用的模型实例；取不到返回 None。"""
         try:
-            p = await self.context.get_using_provider_async(
+            return await self.context.get_using_provider_async(
                 umo=event.unified_msg_origin
             )
-            return p.meta().id if p else None
         except Exception as e:
             logger.warning(f"model_quota: 获取当前模型失败: {e}")
             return None
+
+    async def _current_provider_id(self, event: AstrMessageEvent) -> str | None:
+        p = await self._provider_of(event)
+        return p.meta().id if p else None
 
     def _find_provider(self, token: str) -> tuple[int, str, str] | None:
         """在开放自选的模型中查找，返回 (序号, id, model)。
@@ -926,9 +1089,9 @@ class ModelQuotaPlugin(Star):
 
     def _quota_card_rows_personal(
         self, counts: dict, spent: dict, gspent_map: dict
-    ) -> list[tuple[str, float, bool, str, str, float | None, str]]:
-        """组装个人额度卡片行，只含开放自选的模型 + 个人总额行。"""
-        rows: list[tuple[str, float, bool, str, str, float | None, str]] = []
+    ) -> list[QuotaRow]:
+        """组装个人额度卡片行，只含开放自选的模型（个人总额行由调用方置顶）。"""
+        rows: list[QuotaRow] = []
         for pid, model in self._provider_list(selectable_only=True):
             price = self.price_for(pid, model)
             label = self._display_name(pid, model)
@@ -937,14 +1100,12 @@ class ModelQuotaPlugin(Star):
             peak_note = self.peak_row_suffix(pid, model)
             if price <= 0:
                 rows.append(
-                    (
-                        label,
-                        0.0,
-                        False,
-                        f"免费·{_UNLIMITED}（已用 {used_n} 次）{peak_note}",
-                        "",
-                        None,
-                        "",
+                    QuotaRow(
+                        label=label,
+                        percent=0.0,
+                        limited=False,
+                        sub_left=f"免费·{_UNLIMITED}（已用 {used_n} 次）{peak_note}",
+                        sub_right="",
                     )
                 )
                 continue
@@ -971,14 +1132,13 @@ class ModelQuotaPlugin(Star):
                 if pool_sub:
                     sub_left += f" · {pool_sub}"
                 rows.append(
-                    (
-                        label,
-                        pct,
-                        exhausted,
-                        sub_left,
-                        f"剩 {self.cny(max(ulimit - spent_m, 0))}",
-                        pool_pct,
-                        "",
+                    QuotaRow(
+                        label=label,
+                        percent=pct,
+                        limited=exhausted,
+                        sub_left=sub_left,
+                        sub_right=f"剩 {self.cny(max(ulimit - spent_m, 0))}",
+                        pool_percent=pool_pct,
                     )
                 )
             else:
@@ -987,8 +1147,42 @@ class ModelQuotaPlugin(Star):
                     sub_left += peak_note
                 if pool_sub:
                     sub_left += f" · {pool_sub}"
-                rows.append((label, 0.0, False, sub_left, "", pool_pct, ""))
+                rows.append(
+                    QuotaRow(
+                        label=label,
+                        percent=0.0,
+                        limited=False,
+                        sub_left=sub_left,
+                        sub_right="",
+                        pool_percent=pool_pct,
+                    )
+                )
         return rows
+
+    def _total_row(self, total: float) -> QuotaRow:
+        """个人消费总额行（加粗进度条，固定置顶）。"""
+        tlimit = self.default_user_total_quota
+        if tlimit > 0:
+            pct = min(total / tlimit * 100.0, 100.0)
+            return QuotaRow(
+                label="个人总额",
+                percent=pct,
+                limited=total >= tlimit - _EPS,
+                sub_left=(
+                    f"已花 {self.cny(total)} / 上限 {self.cny(tlimit)}"
+                    f"（所有模型合计）"
+                ),
+                sub_right=f"剩 {self.cny(max(tlimit - total, 0))}",
+                thick=True,
+            )
+        return QuotaRow(
+            label="个人总额",
+            percent=0.0,
+            limited=False,
+            sub_left=f"已花 {self.cny(total)}（总额不限）",
+            sub_right="",
+            thick=True,
+        )
 
     @staticmethod
     def _first_existing(paths: tuple[str, ...]) -> str | None:
@@ -1064,7 +1258,7 @@ class ModelQuotaPlugin(Star):
         title: str,
         name: str,
         subtitle: str,
-        rows: list[tuple[str, float, bool, str, str, float | None, str]],
+        rows: list[QuotaRow],
         note: str = "",
     ) -> str | None:
         """用 Pillow 绘制额度卡片。返回图片路径，失败返回 None。
@@ -1113,6 +1307,8 @@ class ModelQuotaPlugin(Star):
         width = CARD_WIDTH * scale
         pad = CARD_PAD * scale
         bar_h = 8 * scale
+        thick_h = 15 * scale
+        """个人总额行的加粗进度条高度。"""
         pool_h = 5 * scale
         gap_label_bar = 9 * scale
         gap_bar_sub = 8 * scale
@@ -1146,15 +1342,16 @@ class ModelQuotaPlugin(Star):
         if note:
             height += 5 * scale + meta_h
         height += 20 * scale
-        for _label, _percent, _limited, _left, _right, _pool_pct, _pool in rows:
-            height += label_h + gap_label_bar + bar_h
-            if _pool_pct is not None:
+        for _row in rows:
+            row_bar = thick_h if _row.thick else bar_h
+            height += label_h + gap_label_bar + row_bar
+            if _row.pool_percent is not None:
                 height += gap_bar_pool + pool_h
             height += gap_bar_sub + subline_h
             height += gap_section
         if rows:
             height -= gap_section
-        if any(row[2] for row in rows):
+        if any(row.limited for row in rows):
             height += 12 * scale + meta_h
         height += pad
 
@@ -1214,7 +1411,10 @@ class ModelQuotaPlugin(Star):
         cursor += 20 * scale
 
         track_w = width - pad * 2
-        for label, percent, limited, sub_left, sub_right, pool_pct, _pool in rows:
+        for row in rows:
+            label, percent, limited = row.label, row.percent, row.limited
+            sub_left, sub_right, pool_pct = row.sub_left, row.sub_right, row.pool_percent
+            cur_bar_h = thick_h if row.thick else bar_h
             color = self._fill_color(percent, limited)
             pct_text = f"{percent:.0f}%"
             pct_w = probe.textlength(pct_text, font=f_pct)
@@ -1237,18 +1437,18 @@ class ModelQuotaPlugin(Star):
             cursor += label_h + gap_label_bar
 
             draw.rounded_rectangle(
-                (pad, cursor, pad + track_w, cursor + bar_h),
-                radius=bar_h // 2,
+                (pad, cursor, pad + track_w, cursor + cur_bar_h),
+                radius=cur_bar_h // 2,
                 fill=COLOR_TRACK,
             )
             if percent > 0:
-                fill_w = max(int(track_w * percent / 100.0), bar_h)
+                fill_w = max(int(track_w * percent / 100.0), cur_bar_h)
                 draw.rounded_rectangle(
-                    (pad, cursor, pad + fill_w, cursor + bar_h),
-                    radius=bar_h // 2,
+                    (pad, cursor, pad + fill_w, cursor + cur_bar_h),
+                    radius=cur_bar_h // 2,
                     fill=color,
                 )
-            cursor += bar_h
+            cursor += cur_bar_h
             # 总池条：同一模型块内的第二条浅绿色细进度条
             if pool_pct is not None:
                 cursor += gap_bar_pool
@@ -1278,7 +1478,7 @@ class ModelQuotaPlugin(Star):
                 )
             cursor += subline_h + gap_section
 
-        if any(row[2] for row in rows):
+        if any(row.limited for row in rows):
             cursor -= gap_section
             draw.text(
                 (pad, cursor + 12 * scale),
@@ -1304,28 +1504,10 @@ class ModelQuotaPlugin(Star):
         """尝试渲染个人额度图片卡；配置为 text 或渲染失败时返回 None（调用方回退文本）。"""
         if self.quota_render == "text":
             return None
-        rows = self._quota_card_rows_personal(counts, spent, gspent_map)
-        if not rows:
-            return None
-        # 个人总额行
-        tlimit = self.default_user_total_quota
-        if tlimit > 0:
-            pct = min(total / tlimit * 100.0, 100.0)
-            rows.append(
-                (
-                    "个人总额",
-                    pct,
-                    total >= tlimit - _EPS,
-                    f"已花 {self.cny(total)} / 上限 {self.cny(tlimit)}",
-                    f"剩 {self.cny(max(tlimit - total, 0))}",
-                    None,
-                    "",
-                )
-            )
-        else:
-            rows.append(
-                ("个人总额", 0.0, False, f"已花 {self.cny(total)}（总额不限）", "", None, "")
-            )
+        model_rows = self._quota_card_rows_personal(counts, spent, gspent_map)
+        # 个人总额置顶（加粗条）；没有可用模型时也显示总额
+        rows: list[QuotaRow] = [self._total_row(total)]
+        rows.extend(model_rows)
         try:
             name = event.get_sender_name() or ""
         except Exception:
@@ -1343,6 +1525,96 @@ class ModelQuotaPlugin(Star):
             logger.warning("model_quota: 图片渲染失败（缺 Pillow 或中文字体），已回退文本")
         return card
 
+    def _model_list_rows(
+        self,
+        items: list[tuple[str, str]],
+        current: str | None,
+        counts: dict,
+        spent: dict,
+        gspent_map: dict,
+    ) -> list[QuotaRow]:
+        """可选模型列表的卡片行：每行一个模型（进度=个人已用比例）。"""
+        rows: list[QuotaRow] = []
+        for i, (pid, model) in enumerate(items, start=1):
+            price = self.price_for(pid, model)
+            name = self._display_name(pid, model)
+            label = f"{i}. {name}" + ("  *" if pid == current else "")
+            used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
+            spent_m = self._num(spent, pid)
+            if price <= 0:
+                rows.append(
+                    QuotaRow(
+                        label=label,
+                        percent=0.0,
+                        limited=False,
+                        sub_left=f"免费·{_UNLIMITED}（已用 {used_n} 次）",
+                        sub_right="",
+                    )
+                )
+                continue
+            ulimit = self.user_model_limit(pid, model)
+            sub_left = f"${price:.4f}/次" + self.peak_row_suffix(pid, model)
+            sub_left += f" · 已用 {used_n} 次"
+            if ulimit > 0:
+                pct = min(spent_m / ulimit * 100.0, 100.0)
+                rows.append(
+                    QuotaRow(
+                        label=label,
+                        percent=pct,
+                        limited=spent_m + price > ulimit + _EPS,
+                        sub_left=sub_left,
+                        sub_right=f"剩 {self.cny(max(ulimit - spent_m, 0))}",
+                    )
+                )
+            else:
+                rows.append(
+                    QuotaRow(
+                        label=label,
+                        percent=0.0,
+                        limited=False,
+                        sub_left=sub_left,
+                        sub_right="",
+                    )
+                )
+        return rows
+
+    async def _model_list_card(
+        self,
+        event: AstrMessageEvent,
+        items: list[tuple[str, str]],
+        current: str | None,
+        counts: dict,
+        spent: dict,
+        gspent_map: dict,
+        total: float,
+    ) -> str | None:
+        """渲染可选模型图片卡；配置为 text 或缺 Pillow 时返回 None。"""
+        if self.quota_render == "text":
+            return None
+        rows: list[QuotaRow] = [self._total_row(total)]
+        rows.extend(
+            self._model_list_rows(items, current, counts, spent, gspent_map)
+        )
+        try:
+            name = event.get_sender_name() or ""
+        except Exception:
+            name = ""
+        subtitle = (
+            f"共 {len(items)} 个可选模型 · 用 /model use <序号> 切换"
+            f"（1$≈{self.cny(1)}）"
+        )
+        card = await asyncio.to_thread(
+            self._render_quota_card,
+            "可选模型",
+            name,
+            subtitle,
+            rows,
+            self._peak_summary_note(include_models=False),
+        )
+        if card is None and self.quota_render == "image":
+            logger.warning("model_quota: 模型列表图片渲染失败，已回退文本")
+        return card
+
     def _model_help(self) -> str:
         return (
             "🤖 模型自选指令\n"
@@ -1350,7 +1622,8 @@ class ModelQuotaPlugin(Star):
             "/model list —— 同上\n"
             "/model use <序号|名称> —— 切换当前对话的模型（例：/model use 2）\n"
             "  快捷写法：/model 2 或 /model Kimi K3（名称带空格也能直接写）\n"
-            "/model me —— 只看我今日的剩余额度\n"
+            "/quota —— 查看我今日剩余额度（等同原来的 /model me）\n"
+            "/think —— 查看或修改当前模型的思考强度\n"
             "说明：私聊谁都可以切换；群聊里只有管理员能切换。\n"
             "列表与切换只包含管理员开放的模型（selectable_models）。\n"
             "切换按当前会话生效（私聊按人，群聊按整群），消费按人统计。"
@@ -1385,6 +1658,13 @@ class ModelQuotaPlugin(Star):
             bot = self._bot_id(event)
             counts, spent, total = self._personal_totals(data, ukey)
             gspent_map, gcount_map = self._pool_totals(data, bot)
+            # 先尝试图片卡（与 /quota 同款渲染），失败回退文本
+            card = await self._model_list_card(
+                event, items, current, counts, spent, gspent_map, total
+            )
+            if card:
+                yield event.image_result(card)
+                return
             lines = ["🤖 可选 AI 模型（* 为当前对话正在用）："]
             for i, (pid, model) in enumerate(items, start=1):
                 mark = " *" if pid == current else ""
@@ -1416,26 +1696,9 @@ class ModelQuotaPlugin(Star):
             return
 
         if act in ("me", "my", "mine", "我的", "额度"):
-            data = await self._load_usage()
-            ukey = self._user_key(event)
-            bot = self._bot_id(event)
-            counts, spent, total = self._personal_totals(data, ukey)
-            gspent_map, gcount_map = self._pool_totals(data, bot)
-            card = await self._personal_quota_card(
-                event, counts, spent, gspent_map, total
+            yield event.plain_result(
+                "ℹ️ /model me 已移除，请改用 /quota（别名 /额度、/限额）查看今日剩余额度。"
             )
-            if card:
-                yield event.image_result(card)
-                return
-            lines = [f"📊 我今日剩余额度（1$≈{self.cny(1)}）："]
-            rem_lines = self._remaining_lines(
-                counts, spent, gspent_map, gcount_map
-            )
-            lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
-            lines.append(self._total_line(total))
-            lines.append(self._reset_line())
-            lines.extend(self._peak_note_lines())
-            yield event.plain_result("\n".join(lines))
             return
 
         # 切换：/model use <t> | /model <序号|ID|显示名>

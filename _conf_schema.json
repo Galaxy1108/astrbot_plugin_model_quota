@@ -133,6 +133,30 @@
     "type": "bool",
     "default": true
   },
+  "think_enabled": {
+    "description": "启用 /think 思考强度命令",
+    "hint": "关闭后不注册该功能，也不会改写 provider 的推理强度。",
+    "type": "bool",
+    "default": true
+  },
+  "think_admin_only": {
+    "description": "思考强度仅管理员可改",
+    "hint": "注意：AstrBot 的 reasoning_effort 只能通过 provider 的 custom_extra_body 生效，因此该设置是按模型全局生效（同模型所有用户共用），无法按人隔离。因此默认仅管理员可改，普通用户仍可用 /think 查看。",
+    "type": "bool",
+    "default": true
+  },
+  "think_levels": {
+    "description": "允许的思考强度级别",
+    "hint": "供 /think 校验与提示使用；off 会写成 API 的 none。实际支持的值取决于模型。",
+    "type": "list",
+    "default": ["off", "minimal", "low", "medium", "high"]
+  },
+  "default_think_effort": {
+    "description": "默认思考强度（可留空）",
+    "hint": "留空表示不改写 provider 的推理强度，完全跟随模型服务自身配置；填了就作为该 bot 上所有模型的默认值。",
+    "type": "string",
+    "default": ""
+  },
   "quota_exceeded_tip": {
     "description": "个人单模型限额用尽时的回复",
     "hint": "占位符：{model} 模型ID、{used} 已用次数、{spent} 已花(人民币)、{limit} 上限(人民币)。",

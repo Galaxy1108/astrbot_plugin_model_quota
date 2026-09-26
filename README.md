@@ -72,8 +72,13 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `/model`（别名 `/模型`） | 开放自选的模型列表（带单价）、当前模型（`*`）、自己今日剩余额度 |
 | `/model list` | 同上 |
 | `/model use <序号\|ID>` | 切换当前对话的模型，例：`/model use 2`（序号按开放列表数） |
-| `/model 2`、`/model <ID>` | 快捷切换写法 |
-| `/model me` | 只看自己今日剩余额度（图片卡） |
+| `/model 2`、`/model <名称>` | 快捷切换写法（名称带空格可直接写） |
+| `/think` | 查看或修改当前模型的思考强度 |
+| `/quota` | 查看自己今日剩余额度（原 `/model me` 已移除，用这个） |
+
+`/model` 与 `/model list` 都会出**图片卡**（同 `/quota` 的渲染，Pillow 缺失时自动回退文本）：
+顶部是加粗的「个人总额」进度条，下面每行一个模型，带序号、单价、当日已用次数与剩余额度，
+当前模型标 `*`。
 
 **群聊规则**：群里**只有管理员能切换**模型（AstrBot 管理员判定，`event.is_admin()`）；
 普通群成员可查看列表、可查自己的剩余额度。私聊谁都可以切换。
@@ -97,11 +102,11 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 ```text
 📊 我今日剩余额度（1$≈¥7.20）：
-- Kimi K3 ███ 37% 已花 ¥0.66/¥1.80（3 次）剩 ¥1.14 · 总池已花 ¥3.60/¥7.20（剩 ¥3.60）
-- GLM-5.2 ██ 28% 已花 ¥2.01/¥7.20（20 次）剩 ¥5.19 · 总池已花 ¥1.44/¥7.20（剩 ¥5.76）
+- Kimi K3 ███ 37% 已花 ¥0.66/¥1.80（3 次）剩 ¥1.14 · 总池已花 ¥0.88/¥7.20（剩 ¥6.32）
+- GLM-5.2 ██ 28% 已花 ¥2.01/¥7.20（20 次）剩 ¥5.19 · 总池已花 ¥2.01/¥7.20（剩 ¥5.19）
 - DeepSeek V4.1 Flash ██ 18% 已花 ¥1.33/¥7.20（400 次）剩 ¥5.87 · 谷时（峰时 2×）
-💰 个人总额 ████ 40% 已花 ¥0.96/¥14.40 剩 ¥13.44
-⏰ 每日 00:00 重置（13 小时 35 分后重置，明天 00:00）
+💰 个人总额 ███ 28% 已花 ¥4.00/¥14.40 剩 ¥10.40
+⏰ 每日 00:00 重置（13 小时后重置，明天 00:00）
 🕐 当前谷时；峰时 2×（周一至五 01:00-04:00、06:00-10:00 UTC+0）
 ```
 
@@ -109,6 +114,22 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 有总池的模型总池花费并在同一行；
 最后再有一行**个人今日总花费与剩余额度**。免费模型显示"免费·不限"。
 文本版末尾会附重置时间与峰谷状态。
+
+## 思考强度 `/think`
+
+```text
+/think              # 查看当前模型的思考强度
+/think high         # 设为 high（可选 off / minimal / low / medium / high）
+/think reset        # 清除设置，跟随模型服务自身配置
+```
+
+> ⚠️ **按模型生效，不是按人**。AstrBot 的 `reasoning_effort` 只能通过 provider 的
+> `custom_extra_body` 生效（请求级的 kwargs 不会并入 payload），所以插件改的是
+> 「这个模型在当前 bot 上的推理强度」，同模型的所有用户共用。
+> 因此默认 `think_admin_only: true`，仅管理员可改；普通用户仍可用 `/think` 查看当前值。
+>
+> 若模型服务里已经手填了 `custom_extra_body.reasoning_effort`，两者会互相覆盖
+> （本插件在每次调用前按当前设置写入）。
 
 ## 管理员指令（`/quota` 子命令，仅管理员）
 
@@ -145,6 +166,10 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |
 | `quota_render` | auto | 个人额度展示：`auto`/`image`（图片卡）/`text` |
 | `admin_exempt` | true | 管理员免限额且不计数（不占总池） |
+| `think_enabled` | true | 启用 `/think` 思考强度命令 |
+| `think_admin_only` | true | 思考强度仅管理员可改（普通用户仍可查看） |
+| `think_levels` | `["off","minimal","low","medium","high"]` | 允许的级别（`off` 写成 API 的 `none`） |
+| `default_think_effort` | 空 | 留空=不改写 provider，跟随模型服务自身配置 |
 
 `model_*` 的 key 是 WebUI「模型服务」中的**提供商 ID**；
 缺省走 default；`<=0` 视为不限。
