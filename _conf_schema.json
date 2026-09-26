@@ -1,0 +1,90 @@
+{
+  "selectable_models": {
+    "description": "允许用户自选的模型（提供商 ID 列表）",
+    "hint": "只填你想开放给用户切换的 AI 的提供商 ID。/model 列表与切换只认这里；留空表示全部可用。写错的 ID 会在日志 warning。",
+    "type": "list",
+    "default": []
+  },
+  "default_call_price_usd": {
+    "description": "模型单次调用默认单价（美元）",
+    "hint": "对所有未单独配置单价的模型生效。0 表示免费，该模型不受金额限额约束。",
+    "type": "float",
+    "default": 0.0
+  },
+  "model_call_prices_usd": {
+    "description": "按模型覆盖单次调用单价（美元）",
+    "hint": "key 为 WebUI「模型服务」中的提供商 ID，value 为每次对话的美元单价。只对配置了单价的模型做金额限额。",
+    "type": "dict",
+    "items": {},
+    "default": {}
+  },
+  "default_user_model_quota_usd": {
+    "description": "每人每天每个模型的默认限额（美元）",
+    "hint": "对所有未单独配置的模型生效。0 或负数表示不限。",
+    "type": "float",
+    "default": 1.0
+  },
+  "model_user_quotas_usd": {
+    "description": "按模型覆盖每人每日限额（美元）",
+    "hint": "key 为提供商 ID，value 为美元金额，0 表示该模型不限。缺省的模型使用上面的默认值。",
+    "type": "dict",
+    "items": {},
+    "default": {}
+  },
+  "default_user_total_quota_usd": {
+    "description": "每人每天全部模型的消费总额度（美元）",
+    "hint": "一个人在所有模型上的当日总花费上限。0 或负数表示不限。",
+    "type": "float",
+    "default": 2.0
+  },
+  "default_global_quota_usd": {
+    "description": "全用户每日总限额默认值（美元）",
+    "hint": "所有非管理员用户在单个模型上的共享总花费。0 或负数表示不限。",
+    "type": "float",
+    "default": 0.0
+  },
+  "model_global_quotas_usd": {
+    "description": "按模型覆盖全用户每日总限额（美元）",
+    "hint": "key 为提供商 ID，value 为全用户共享的美元总额，0 表示不限。缺省的模型使用上面的默认值。",
+    "type": "dict",
+    "items": {},
+    "default": {}
+  },
+  "usd_to_cny_rate": {
+    "description": "美元兑人民币汇率（仅用于显示）",
+    "hint": "配置用美元，展示给用户时按此汇率换算成人民币。",
+    "type": "float",
+    "default": 7.2
+  },
+  "quota_render": {
+    "description": "/quota 个人额度展示方式",
+    "hint": "auto：有 Pillow 和中文字体时发额度图片卡，否则回退文本；image：强制图片（失败回退文本并记日志）；text：只发文本。",
+    "type": "string",
+    "options": ["auto", "image", "text"],
+    "default": "auto"
+  },
+  "admin_exempt": {
+    "description": "管理员免限额且不计数",
+    "hint": "开启后管理员（event.is_admin()）不受任何限额限制，其消费也不计入总额与总池。",
+    "type": "bool",
+    "default": true
+  },
+  "quota_exceeded_tip": {
+    "description": "个人单模型限额用尽时的回复",
+    "hint": "占位符：{model} 模型ID、{used} 已用次数、{spent} 已花(人民币)、{limit} 上限(人民币)。",
+    "type": "text",
+    "default": "⏳ 你今天在 {model} 上的额度已用完（已花 {spent}/{limit}），明天再来吧～也可以 /model 换个模型试试。"
+  },
+  "total_exceeded_tip": {
+    "description": "个人每日总额度用尽时的回复",
+    "hint": "占位符：{spent} 今日已花(人民币)、{limit} 总上限(人民币)。",
+    "type": "text",
+    "default": "💰 你今天的消费总额度已用完（已花 {spent}/{limit}），明天再来吧～"
+  },
+  "global_exhausted_tip": {
+    "description": "全局总限额用尽时的回复",
+    "hint": "占位符：{model} 模型ID、{used} 全用户已用次数、{spent} 总池已花(人民币)、{limit} 总上限(人民币)。",
+    "type": "text",
+    "default": "🈵 {model} 今天的全用户总限额已用完（已花 {spent}/{limit}），明天再来吧～也可以 /model 换个模型试试。"
+  }
+}
