@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>模型与额度</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>模型 · 思考强度 · 额度</h1>
+        <p class="sub" id="meta">加载中…</p>
+      </div>
+      <div class="actions">
+        <label class="switch">
+          <input type="checkbox" id="auto" checked />
+          <span>自动刷新（10s）</span>
+        </label>
+        <button id="refresh" class="btn">刷新</button>
+      </div>
+    </header>
+
+    <p class="note" id="peak-note"></p>
+    <p class="error" id="error" hidden></p>
+
+    <main id="conversations" class="grid"></main>
+
+    <section class="catalog">
+      <h2>模型目录</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>模型</th>
+              <th>单价（低谷）</th>
+              <th>峰谷</th>
+              <th>每人每日</th>
+              <th>每 bot 总池</th>
+              <th>思考强度</th>
+            </tr>
+          </thead>
+          <tbody id="catalog-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

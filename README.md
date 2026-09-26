@@ -31,6 +31,14 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | MiMo-V2.6-Flash | $60 | $0.0004 |
 | Space Bunny Free | 限时免费 | $0（免费） |
 
+### 只用 OpenCode 的模型（`opencode_only_models`，默认开启）
+
+预设开启时，`/model` 列表、切换与插件页面**只包含 OpenCode 提供商的模型**：
+按 provider 的 `api_base` 是否包含 `opencode_api_base_match`（默认 `opencode.ai`）判断，
+也会认 provider/id 里带 `opencode` 的配置。
+如果当前机器人一个 OpenCode 提供商都没有，会自动放开限制并在日志里提示，避免列表变空。
+想混用其他提供商的模型，把 `opencode_only_models` 关掉即可。
+
 ### 峰谷定价（`peak_pricing_enabled`，默认开启）
 
 官方仅 DeepSeek 系列有峰谷，**峰时价格为低谷的 2×**：
@@ -55,7 +63,8 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 另外两条全局规则（与预设同时生效）：
 
-- **每 bot 每模型总池 $1/天**（`default_global_quota_usd`）：同一个 bot 上所有非管理员用户共享；
+- **每 bot 每模型总池**：按官方月额度 ÷15 分档 —— **$15→$1、$30→$2、$60→$4**
+  （同一个 bot 上所有非管理员用户共享）；
 - **每人每天消费总额 $2**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总。
 
 > ⚠️ **总池按 bot 分开**：一个 bot 一个独立总池，多个 bot 之间不合并。
@@ -119,7 +128,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 ```text
 /think              # 查看当前模型的思考强度
-/think high         # 设为 high（可选 off / minimal / low / medium / high）
+/think max          # 设为 max（可选 off / minimal / low / medium / high / max）
 /think reset        # 清除设置，跟随模型服务自身配置
 ```
 
@@ -130,6 +139,29 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 >
 > 若模型服务里已经手填了 `custom_extra_body.reasoning_effort`，两者会互相覆盖
 > （本插件在每次调用前按当前设置写入）。
+
+## WebUI 插件页面（模型 · 思考强度 · 额度）
+
+在 WebUI 插件页打开本插件的 **「模型与额度」** 页面（`pages/panel/`），可以看到：
+
+- **每个对话**一张卡片：对话名（平台 + 私聊/群号）、最后活跃时间、当前使用的模型、
+  当前思考强度、峰谷状态、参与人数、合计已花；
+- 卡片内**逐个模型**列出：已用次数、已花金额 / 个人上限、剩余额度、
+  以及该 bot 的总池用量（浅色条）；
+- 每个模型带两个重置按钮：**重置该模型额度**（只清这个对话）与
+  **重置本 bot 全部对话**（清该 bot 上所有对话在该模型的用量）；
+- 底部**模型目录表**：单价（低谷）、是否有峰谷、每人每日上限、每 bot 总池、思考强度。
+
+页面通过 `window.AstrBotPluginPage` bridge 调用插件后端，接口为：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `panel/overview` | 对话列表 + 模型目录 + 限额快照 |
+| POST | `panel/reset` | `{provider_id, umo?, scope?}`，`scope` 为 `conversation`（默认）或 `bot` |
+| POST | `panel/think` | `{provider_id, level}`，`level` 为级别或 `reset` |
+
+> 对话索引在每次 AI 请求时记录（同一对话最快 60 秒写一次），按 bot 分开。
+> 重置只清零用量记录，不改配置。
 
 ## 管理员指令（`/quota` 子命令，仅管理员）
 
@@ -161,14 +193,16 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `default_user_model_quota_usd` | 1.0 | 未命中预设且未单独配置时的每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
 | `default_user_total_quota_usd` | 2.0 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
-| `default_global_quota_usd` | 1.0 | **每个 bot 每模型的每日总池**（各 bot 独立，不合并）；0=不限 |
+| `default_global_quota_usd` | 1.0 | 总池兜底值（预设下按档位换算 $15→$1/$30→$2/$60→$4）；各 bot 独立；0=不限 |
 | `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |
 | `quota_render` | auto | 个人额度展示：`auto`/`image`（图片卡）/`text` |
 | `admin_exempt` | true | 管理员免限额且不计数（不占总池） |
+| `opencode_only_models` | true | 预设下只展示 OpenCode 提供商的模型 |
+| `opencode_api_base_match` | `opencode.ai` | 判定 OpenCode 提供商的 api_base 关键字 |
 | `think_enabled` | true | 启用 `/think` 思考强度命令 |
 | `think_admin_only` | true | 思考强度仅管理员可改（普通用户仍可查看） |
-| `think_levels` | `["off","minimal","low","medium","high"]` | 允许的级别（`off` 写成 API 的 `none`） |
+| `think_levels` | `["off","minimal","low","medium","high","max"]` | 允许的级别（`off` 写成 API 的 `none`） |
 | `default_think_effort` | 空 | 留空=不改写 provider，跟随模型服务自身配置 |
 
 `model_*` 的 key 是 WebUI「模型服务」中的**提供商 ID**；

@@ -1,0 +1,8 @@
+{
+  "pages": {
+    "panel": {
+      "title": "Models & Quota",
+      "description": "Per-conversation model, thinking effort and daily quota, with per-model usage reset."
+    }
+  }
+}

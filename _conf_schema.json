@@ -5,6 +5,18 @@
     "type": "list",
     "default": []
   },
+  "opencode_only_models": {
+    "description": "只在 OpenCode 预设下展示 OpenCode 提供商的模型",
+    "hint": "开启后，/model 列表、切换与页面只包含 api_base 含下面关键字的提供商（找不到任何 OpenCode 提供商时会自动放开，避免列表变空）。",
+    "type": "bool",
+    "default": true
+  },
+  "opencode_api_base_match": {
+    "description": "OpenCode 提供商的 api_base 关键字",
+    "hint": "默认 opencode.ai，与 OpenCode Go 的接口域名一致。",
+    "type": "string",
+    "default": "opencode.ai"
+  },
   "model_display_names": {
     "description": "模型显示名映射",
     "hint": "key 为提供商 ID，value 为展示给用户的模型名，如 {\"default\": \"Kimi K3\", \"vip\": \"GPT 5.6 Luna\"}。列表、卡片、额度显示都用显示名；切换仍用序号或名称。缺省用模型自带名称。",
@@ -16,7 +28,10 @@
     "description": "内置单价预设",
     "hint": "opencode_go：按 OpenCode Go 官方价目表（每月额度 ÷ 每月预估请求数）自动换算单次单价，峰谷模型已内置；off：只用下面手填的单价。显式填写的单价优先级更高。",
     "type": "string",
-    "options": ["opencode_go", "off"],
+    "options": [
+      "opencode_go",
+      "off"
+    ],
     "default": "opencode_go"
   },
   "default_call_price_usd": {
@@ -48,7 +63,10 @@
     "description": "峰时区间（HH:MM-HH:MM，可填多个）",
     "hint": "按下面时区解释，支持跨天如 22:00-02:00。官方 DeepSeek 峰时为周一至五 01:00-04:00 与 06:00-10:00 UTC（即北京时间 09:00-12:00、14:00-18:00）。",
     "type": "list",
-    "default": ["01:00-04:00", "06:00-10:00"]
+    "default": [
+      "01:00-04:00",
+      "06:00-10:00"
+    ]
   },
   "peak_timezone_offset": {
     "description": "峰时区偏移（小时，UTC 为 0）",
@@ -79,7 +97,10 @@
     "description": "内置限额预设",
     "hint": "opencode_go：按 OpenCode Go 官方每月额度 ÷ 60 自动得出每人每日额度（月额度 $60 → 每人每天 $1，$30 → $0.5，$15 → $0.25）；off：只用下面手填的限额。显式填写的限额优先级更高。",
     "type": "string",
-    "options": ["opencode_go", "off"],
+    "options": [
+      "opencode_go",
+      "off"
+    ],
     "default": "opencode_go"
   },
   "default_user_model_quota_usd": {
@@ -102,8 +123,8 @@
     "default": 2.0
   },
   "default_global_quota_usd": {
-    "description": "每个 bot 每模型的每日总池（美元）",
-    "hint": "同一个 bot 上所有非管理员用户共享。总池按 bot 分开统计：多个 bot 各有一个独立总池，不会合并。默认 1 美元。0 或负数表示不限。",
+    "description": "每 bot 每模型每日总池默认值（美元，未命中预设时用）",
+    "hint": "OpenCode 预设下总池按官方月额度 ÷15 自动换算：$15→$1、$30→$2、$60→$4。这里只是未命中月额度表时的兜底值。总池按 bot 分开统计，多个 bot 各有一个独立总池。0 或负数表示不限。",
     "type": "float",
     "default": 1.0
   },
@@ -124,7 +145,11 @@
     "description": "/quota 个人额度展示方式",
     "hint": "auto：有 Pillow 和中文字体时发额度图片卡，否则回退文本；image：强制图片（失败回退文本并记日志）；text：只发文本。",
     "type": "string",
-    "options": ["auto", "image", "text"],
+    "options": [
+      "auto",
+      "image",
+      "text"
+    ],
     "default": "auto"
   },
   "admin_exempt": {
@@ -149,7 +174,14 @@
     "description": "允许的思考强度级别",
     "hint": "供 /think 校验与提示使用；off 会写成 API 的 none。实际支持的值取决于模型。",
     "type": "list",
-    "default": ["off", "minimal", "low", "medium", "high"]
+    "default": [
+      "off",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "max"
+    ]
   },
   "default_think_effort": {
     "description": "默认思考强度（可留空）",

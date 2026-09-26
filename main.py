@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import NamedTuple
@@ -46,7 +47,16 @@ _USAGE_KEY = "daily_usage_v3"
 _THINK_KEY = "think_efforts_v1"
 """KV 存储中「模型 -> 思考强度」的键名。"""
 
-THINK_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high")
+PLUGIN_NAME = "astrbot_plugin_model_quota"
+"""插件名（Web API 路由前缀）。"""
+
+_CONV_KEY = "conversations_v1"
+"""KV 存储中「对话索引」的键名：umo -> 会话元数据。"""
+
+_CONV_TOUCH_SECONDS = 60
+"""同一对话最快多久更新一次索引，避免每条消息都写存储。"""
+
+THINK_LEVELS: tuple[str, ...] = ("off", "minimal", "low", "medium", "high", "max")
 """可选思考强度；off 映射为 API 的 none。"""
 
 THINK_OFF_VALUE = "none"
@@ -136,7 +146,10 @@ QUOTA_PRESET_OPENCODE_GO = "opencode_go"
 """内置限额预设名：按官方每月额度 ÷ 60 换算成每人每日额度。"""
 
 _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
-"""限额预设下所有模型的全用户每日总池（美元）。"""
+"""限额预设下未命中月额度表时的总池默认值（美元）。"""
+
+_QUOTA_POOL_DIVISOR = 15.0
+"""总池换算：官方月额度 ÷ 15，即 $15→$1、$30→$2、$60→$4。"""
 
 _QUOTA_PRESET_DEFAULT_TOTAL = 2.0
 """限额预设下每人每天消费总额度（美元）。"""
@@ -295,6 +308,15 @@ class ModelQuotaPlugin(Star):
             str(cfg.get("default_think_effort", "") or "").strip().lower()
         )
         self._think_efforts: dict[str, str] | None = None
+        self._think_original: dict[str, object] = {}
+        """记录被本插件改写前的 reasoning_effort，reset 时还原。"""
+        # 只在 OpenCode 预设下展示 OpenCode 提供商的模型
+        self.opencode_only_models: bool = bool(cfg.get("opencode_only_models", True))
+        self.opencode_api_base_match: str = (
+            str(cfg.get("opencode_api_base_match", "opencode.ai") or "").strip().lower()
+        )
+        self._conversations: dict[str, dict] | None = None
+        self._warned_no_opencode = False
         self.quota_render: str = (
             str(cfg.get("quota_render", "auto") or "auto").strip().lower()
         )
@@ -320,6 +342,29 @@ class ModelQuotaPlugin(Star):
                 "明天再来吧～也可以 /model 换个模型试试。",
             )
         )
+
+        # 插件页面（WebUI）后端接口
+        try:
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/panel/overview",
+                self.web_overview,
+                ["GET"],
+                "模型与额度总览",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/panel/reset",
+                self.web_reset,
+                ["POST"],
+                "重置某模型的额度用量",
+            )
+            self.context.register_web_api(
+                f"/{PLUGIN_NAME}/panel/think",
+                self.web_set_think,
+                ["POST"],
+                "设置某模型的思考强度",
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 注册插件页面接口失败: {e}")
 
     # ------------------------------------------------------------------
     # 配置解析与金额换算
@@ -551,9 +596,19 @@ class ModelQuotaPlugin(Star):
             return None
         return _OPENCODE_GO_MONTHLY_LIMITS.get(key)
 
-    def global_limit(self, provider_id: str) -> float:
-        """某模型全用户每日总限额（美元，<=0 不限）。"""
-        return self.model_global_quotas.get(provider_id, self.default_global_quota)
+    def global_limit(self, provider_id: str, model: str = "") -> float:
+        """某模型在单个 bot 上的每日总池（美元，<=0 不限）。
+
+        优先级：model_global_quotas_usd 显式配置 > 内置限额预设
+        （官方月额度 ÷ 15，即 $15→$1、$30→$2、$60→$4）> default_global_quota_usd。
+        """
+        if provider_id in self.model_global_quotas:
+            return self.model_global_quotas[provider_id]
+        if self.quota_preset == QUOTA_PRESET_OPENCODE_GO:
+            monthly = self._preset_monthly_limit(provider_id, model)
+            if monthly is not None:
+                return monthly / _QUOTA_POOL_DIVISOR
+        return self.default_global_quota
 
     def cny(self, usd: float) -> str:
         """美元转人民币展示（¥x.xx）。"""
@@ -666,8 +721,15 @@ class ModelQuotaPlugin(Star):
             records[ukey] = per_user
         bucket = per_user.get(bot)
         if not isinstance(bucket, dict):
-            bucket = {"name": "", "counts": {}, "spent": {}}
+            bucket = {"name": "", "counts": {}, "spent": {}, "umo": ""}
             per_user[bot] = bucket
+        if event is not None:
+            try:
+                umo = str(event.unified_msg_origin or "")
+                if umo:
+                    bucket["umo"] = umo
+            except Exception:
+                pass
         for k in ("counts", "spent"):
             if not isinstance(bucket.get(k), dict):
                 bucket[k] = {}
@@ -741,6 +803,143 @@ class ModelQuotaPlugin(Star):
         spent_map, count_map = self._pool_totals(data, bot)
         return self._num(spent_map, pid), int(count_map.get(pid, 0) or 0)
 
+    # ------------------------------------------------------------------
+    # 对话索引（供插件页面展示「每个对话的模型/思考强度/额度」）
+    # ------------------------------------------------------------------
+
+    async def _load_conversations(self) -> dict:
+        data = await self.get_kv_data(_CONV_KEY, None)
+        if not isinstance(data, dict):
+            data = {}
+        return data
+
+    async def _touch_conversation(self, event: AstrMessageEvent) -> None:
+        """记录/刷新一个对话（限频写入，避免每条消息都写存储）。"""
+        try:
+            umo = str(event.unified_msg_origin or "")
+            if not umo:
+                return
+            convs = await self._load_conversations()
+            entry = convs.get(umo)
+            now = int(time.time())
+            if not isinstance(entry, dict):
+                entry = {}
+                convs[umo] = entry
+            elif now - int(entry.get("ts") or 0) < _CONV_TOUCH_SECONDS:
+                return
+            def _safe(fn, default=""):
+                try:
+                    value = fn()
+                except Exception:  # noqa: BLE001
+                    return default
+                return default if value is None else value
+
+            entry.update(
+                {
+                    "ts": now,
+                    "bot": self._bot_id(event),
+                    "platform": _safe(event.get_platform_name),
+                    "user_key": self._user_key(event),
+                    "sender": _safe(event.get_sender_name),
+                    "group_id": str(_safe(event.get_group_id)),
+                    "private": bool(_safe(event.is_private_chat, False)),
+                }
+            )
+            await self.put_kv_data(_CONV_KEY, convs)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"model_quota: 更新对话索引失败: {e}")
+
+    def conversation_usage(
+        self, data: dict, umo: str, bot: str | None = None
+    ) -> tuple[dict, dict]:
+        """某个对话当日的 (各模型花费表, 各模型次数表)，跨该对话内所有用户汇总。"""
+        spent: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        records = data.get("records", {})
+        if not isinstance(records, dict):
+            return spent, counts
+        for per_user in records.values():
+            if not isinstance(per_user, dict):
+                continue
+            for b, bucket in per_user.items():
+                if not isinstance(bucket, dict):
+                    continue
+                if bot is not None and str(b) != bot:
+                    continue
+                if str(bucket.get("umo") or "") != umo:
+                    continue
+                bspent = bucket.get("spent", {})
+                if isinstance(bspent, dict):
+                    for pid, v in bspent.items():
+                        if isinstance(v, (int, float)) and v > 0:
+                            spent[pid] = round(spent.get(pid, 0.0) + v, 10)
+                bcounts = bucket.get("counts", {})
+                if isinstance(bcounts, dict):
+                    for pid, n in bcounts.items():
+                        if isinstance(n, int) and n > 0:
+                            counts[pid] = counts.get(pid, 0) + n
+        return spent, counts
+
+    def conversation_users(self, data: dict, umo: str) -> list[str]:
+        """用过这个对话的用户 key 列表。"""
+        users: list[str] = []
+        records = data.get("records", {})
+        if not isinstance(records, dict):
+            return users
+        for ukey, per_user in records.items():
+            if not isinstance(per_user, dict):
+                continue
+            for bucket in per_user.values():
+                if isinstance(bucket, dict) and str(bucket.get("umo") or "") == umo:
+                    users.append(str(ukey))
+                    break
+        return users
+
+    def reset_model_usage(
+        self,
+        data: dict,
+        provider_id: str,
+        *,
+        bot: str | None = None,
+        umo: str | None = None,
+    ) -> tuple[int, int]:
+        """把某模型在指定范围内的用量清零（个人桶 + 次数）。
+
+        总池是从桶里推导出来的，所以清零后总池自动回落。
+        返回 (受影响的用户数, 被清零的桶数)。
+        """
+        users_hit = 0
+        buckets_hit = 0
+        records = data.get("records", {})
+        if not isinstance(records, dict):
+            return 0, 0
+        for per_user in records.values():
+            if not isinstance(per_user, dict):
+                continue
+            touched_user = False
+            for b, bucket in per_user.items():
+                if not isinstance(bucket, dict):
+                    continue
+                if bot is not None and str(b) != bot:
+                    continue
+                if umo is not None and str(bucket.get("umo") or "") != umo:
+                    continue
+                spent = bucket.get("spent")
+                counts = bucket.get("counts")
+                changed = False
+                if isinstance(spent, dict) and provider_id in spent:
+                    spent.pop(provider_id, None)
+                    changed = True
+                if isinstance(counts, dict) and provider_id in counts:
+                    counts.pop(provider_id, None)
+                    changed = True
+                if changed:
+                    buckets_hit += 1
+                    touched_user = True
+            if touched_user:
+                users_hit += 1
+        return users_hit, buckets_hit
+
     def _active_bots(self, data: dict) -> list[str]:
         """今日有记录的 bot 列表。"""
         bots: set[str] = set()
@@ -777,6 +976,8 @@ class ModelQuotaPlugin(Star):
 
         # 思考强度按模型生效，管理员也照常应用（放在豁免判断之前）
         await self._apply_think_effort(provider, pid)
+        # 记录对话，供插件页面展示
+        await self._touch_conversation(event)
 
         if self.admin_exempt and event.is_admin():
             return  # 管理员免限额且不计数
@@ -812,7 +1013,7 @@ class ModelQuotaPlugin(Star):
                 event.stop_event()
                 return
 
-            glimit = self.global_limit(pid)
+            glimit = self.global_limit(pid, model_name)
             if glimit > 0 and gspent + price > glimit + _EPS:
                 tip = self.global_exhausted_tip.format(
                     model=disp,
@@ -866,27 +1067,47 @@ class ModelQuotaPlugin(Star):
         efforts = await self._load_think_efforts()
         return efforts.get(provider_id, self.default_think_effort)
 
-    async def _apply_think_effort(self, provider: object, provider_id: str) -> None:
-        """把该模型的思考强度写进 provider 的 custom_extra_body。"""
-        if not self.think_enabled:
-            return
-        level = await self.think_effort_of(provider_id)
-        if not level:
-            return
+    def _think_body(self, provider: object) -> dict | None:
+        """取得（必要时创建）provider 的 custom_extra_body。"""
         config = getattr(provider, "provider_config", None)
         if not isinstance(config, dict):
-            return
+            return None
         body = config.get("custom_extra_body")
         if not isinstance(body, dict):
             body = {}
             config["custom_extra_body"] = body
-        value = self._think_api_value(level)
-        if body.get("reasoning_effort") != value:
-            body["reasoning_effort"] = value
-            logger.info(
-                f"model_quota: 已将模型 {provider_id} 的思考强度设为 {level}"
-                f"（reasoning_effort={value}）"
-            )
+        return body
+
+    async def _apply_think_effort(self, provider: object, provider_id: str) -> None:
+        """把该模型的思考强度写进 provider 的 custom_extra_body。
+
+        未设置（或已 reset）时，若之前被本插件改写过，则还原成原值。
+        """
+        if not self.think_enabled:
+            return
+        body = self._think_body(provider)
+        if body is None:
+            return
+        level = await self.think_effort_of(provider_id)
+        if level:
+            # 首次改写前记下原值，供 reset 还原
+            self._think_original.setdefault(provider_id, body.get("reasoning_effort"))
+            value = self._think_api_value(level)
+            if body.get("reasoning_effort") != value:
+                body["reasoning_effort"] = value
+                logger.info(
+                    f"model_quota: 已将模型 {provider_id} 的思考强度设为 {level}"
+                    f"（reasoning_effort={value}）"
+                )
+            return
+        # 未设置：还原原值
+        if provider_id in self._think_original:
+            original = self._think_original.pop(provider_id)
+            if original is None:
+                body.pop("reasoning_effort", None)
+            else:
+                body["reasoning_effort"] = original
+            logger.info(f"model_quota: 已还原模型 {provider_id} 的思考强度设置")
 
     def _think_help(self, provider_id: str, model: str, current: str) -> str:
         lines = [
@@ -943,30 +1164,76 @@ class ModelQuotaPlugin(Star):
     # /model 指令（群聊切换仅管理员）
     # ------------------------------------------------------------------
 
-    def _provider_list(self, selectable_only: bool = False) -> list[tuple[str, str]]:
-        """返回 [(provider_id, model名)]。
-
-        Args:
-            selectable_only: 为 True 时只返回白名单内（开放自选）的模型。
-        """
-        items: list[tuple[str, str]] = []
+    def _all_providers(self) -> list:
         try:
-            for p in self.context.get_all_providers():
-                meta = p.meta()
-                items.append((meta.id, meta.model or ""))
+            return list(self.context.get_all_providers())
         except Exception as e:
             logger.warning(f"model_quota: 获取模型列表失败: {e}")
-        if selectable_only and self.selectable_models:
+            return []
+
+    def _preset_active(self) -> bool:
+        """是否启用了任一 OpenCode Go 内置预设。"""
+        return (
+            self.pricing_preset == PRICING_PRESET_OPENCODE_GO
+            or self.quota_preset == QUOTA_PRESET_OPENCODE_GO
+        )
+
+    def is_opencode_provider(self, provider: object) -> bool:
+        """该 provider 是否来自 OpenCode（按 api_base / 名称判断）。"""
+        config = getattr(provider, "provider_config", None)
+        if not isinstance(config, dict):
+            return False
+        match = self.opencode_api_base_match
+        api_base = str(config.get("api_base") or "").lower()
+        if match and match in api_base:
+            return True
+        for key in ("provider", "id", "name", "type"):
+            if "opencode" in str(config.get(key) or "").lower():
+                return True
+        return False
+
+    def _selectable_providers(self) -> list:
+        """开放自选的 provider 列表（应用白名单 + OpenCode 限定）。"""
+        provs = self._all_providers()
+        if self.selectable_models:
             if not self._warned_unknown_selectable:
                 self._warned_unknown_selectable = True
-                known = {pid for pid, _ in items}
+                known = {p.meta().id for p in provs}
                 for pid in self.selectable_models:
                     if pid not in known:
                         logger.warning(
                             f"model_quota: selectable_models 中的 {pid!r} "
                             "在当前提供商中不存在，已忽略"
                         )
-            items = [it for it in items if it[0] in self.selectable_models]
+            provs = [p for p in provs if p.meta().id in self.selectable_models]
+        if self.opencode_only_models and self._preset_active():
+            oc = [p for p in provs if self.is_opencode_provider(p)]
+            if oc:
+                provs = oc
+            elif not self._warned_no_opencode and provs:
+                self._warned_no_opencode = True
+                logger.warning(
+                    "model_quota: 开启了 opencode_only_models，但没有找到 OpenCode "
+                    f"提供商（api_base 含 {self.opencode_api_base_match!r}），"
+                    "本次仍展示全部模型；如不需要可关闭该选项"
+                )
+        return provs
+
+    def _provider_list(self, selectable_only: bool = False) -> list[tuple[str, str]]:
+        """返回 [(provider_id, model名)]。
+
+        Args:
+            selectable_only: 为 True 时只返回开放自选的模型
+                （白名单 + 预设下的 OpenCode 限定）。
+        """
+        provs = self._selectable_providers() if selectable_only else self._all_providers()
+        items: list[tuple[str, str]] = []
+        for p in provs:
+            try:
+                meta = p.meta()
+            except Exception:  # noqa: BLE001
+                continue
+            items.append((meta.id, meta.model or ""))
         return items
 
     async def _provider_of(self, event: AstrMessageEvent):
@@ -1024,7 +1291,7 @@ class ModelQuotaPlugin(Star):
                 continue
             ulimit = self.user_model_limit(pid, model)
             pool_suffix = ""
-            glimit = self.global_limit(pid)
+            glimit = self.global_limit(pid, model)
             if glimit > 0:
                 gspent = self._num(gspent_map, pid)
                 pool_suffix = (
@@ -1110,7 +1377,7 @@ class ModelQuotaPlugin(Star):
                 )
                 continue
             ulimit = self.user_model_limit(pid, model)
-            glimit = self.global_limit(pid)
+            glimit = self.global_limit(pid, model)
             pool_pct: float | None = None
             pool_sub = ""
             if glimit > 0:
@@ -1240,17 +1507,31 @@ class ModelQuotaPlugin(Star):
         return COLOR_GREEN
 
     def _card_output_path(self, name: str) -> Path | None:
+        """卡片输出路径：优先 AstrBot 数据目录，取不到时退回系统临时目录。"""
+        import hashlib
+
+        digest = hashlib.sha256(name.encode("utf-8", "ignore")).hexdigest()[:8]
+        filename = f"quota_{digest}.png"
         try:
             from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-            out_dir = Path(get_astrbot_data_path()) / "plugin_data" / "astrbot_plugin_model_quota"
+            out_dir = (
+                Path(get_astrbot_data_path())
+                / "plugin_data"
+                / "astrbot_plugin_model_quota"
+            )
             out_dir.mkdir(parents=True, exist_ok=True)
-            import hashlib
-
-            digest = hashlib.sha256(name.encode("utf-8", "ignore")).hexdigest()[:8]
-            return out_dir / f"quota_{digest}.png"
+            return out_dir / filename
         except Exception as exc:  # noqa: BLE001
-            logger.debug(f"model_quota: 卡片输出目录不可用: {exc}")
+            logger.debug(f"model_quota: 数据目录不可用，改用临时目录: {exc}")
+        try:
+            import tempfile
+
+            out_dir = Path(tempfile.gettempdir()) / "astrbot_plugin_model_quota"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            return out_dir / filename
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"model_quota: 找不到可写目录，无法渲染图片卡: {exc}")
             return None
 
     def _render_quota_card(
@@ -1746,7 +2027,7 @@ class ModelQuotaPlugin(Star):
                 gspent, _ = self._pool_of(data, bot, pid)
                 ulimit = self.user_model_limit(pid, model)
                 tlimit = self.default_user_total_quota
-                glimit = self.global_limit(pid)
+                glimit = self.global_limit(pid, model)
                 if ulimit > 0 and spent_m + price > ulimit + _EPS:
                     warn = f"\n⚠️ 你在 {disp} 的今日额度已用完，切换后暂时无法用它对话。"
                 elif tlimit > 0 and total + price > tlimit + _EPS:
@@ -1836,7 +2117,7 @@ class ModelQuotaPlugin(Star):
                         f"- {self._display_name(pid, model)}："
                         f"单价 ${self.price_for(pid, model):.4f}/次，"
                         f"总池已花 {self.cny(self._num(gspent_map, pid))}"
-                        f"/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
+                        f"/{self._fmt_limit_usd(self.global_limit(pid, model), self.cny)}"
                         f"（{gcount_map.get(pid, 0)} 次），"
                         f"每人 {self._fmt_limit_usd(self.user_model_limit(pid, model), self.cny)}"
                     )
@@ -1901,7 +2182,7 @@ class ModelQuotaPlugin(Star):
                     lines.append(
                         f"- {self._display_name(pid, model)}："
                         f"总花 {self.cny(gspent if isinstance(gspent, (int, float)) else 0)}"
-                        f"/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
+                        f"/{self._fmt_limit_usd(self.global_limit(pid, model), self.cny)}"
                         f"（{gcount_map.get(pid, 0)} 次，{users_used} 人用过）"
                     )
             if bots:
@@ -1930,6 +2211,190 @@ class ModelQuotaPlugin(Star):
             return
 
         yield event.plain_result(self._quota_help())
+
+    # ------------------------------------------------------------------
+    # 插件页面后端（WebUI）
+    # ------------------------------------------------------------------
+
+    def _conversation_label(self, umo: str, entry: dict) -> str:
+        """给对话起一个可读名字。"""
+        platform = str(entry.get("platform") or "")
+        if entry.get("private"):
+            who = str(entry.get("sender") or entry.get("user_key") or "")
+            return f"[{platform}] 私聊 · {who or umo}"
+        gid = str(entry.get("group_id") or "")
+        return f"[{platform}] 群聊 · {gid or umo}"
+
+    async def _snapshot(self) -> dict:
+        """汇总当前状态，供页面渲染。"""
+        data = await self._load_usage()
+        convs = await self._load_conversations()
+        efforts = await self._load_think_efforts()
+        items = self._provider_list(selectable_only=False)
+        model_of = {pid: model for pid, model in items}
+        catalog_items = self._provider_list(selectable_only=True)
+        now = int(time.time())
+
+        conversations = []
+        for umo, entry in sorted(
+            convs.items(), key=lambda kv: int(kv[1].get("ts") or 0), reverse=True
+        ):
+            if not isinstance(entry, dict):
+                continue
+            bot = str(entry.get("bot") or "")
+            provider = await self._provider_of_umo(umo)
+            pid = provider.meta().id if provider else ""
+            model_name = (provider.meta().model or "") if provider else ""
+            spent_map, count_map = self.conversation_usage(data, umo, bot or None)
+            pool_spent, pool_count = self._pool_totals(data, bot) if bot else ({}, {})
+            users = self.conversation_users(data, umo)
+            personal_total = 0.0
+            for uk in users:
+                _, _, t = self._personal_totals(data, uk)
+                personal_total += t
+            models = []
+            for mpid, spent in sorted(spent_map.items()):
+                mname = model_of.get(mpid, "")
+                models.append(
+                    {
+                        "provider_id": mpid,
+                        "name": self._display_name(mpid, mname),
+                        "used": int(count_map.get(mpid, 0) or 0),
+                        "spent_usd": round(float(spent), 6),
+                        "user_limit_usd": self.user_model_limit(mpid, mname),
+                        "pool_spent_usd": round(self._num(pool_spent, mpid), 6),
+                        "pool_limit_usd": self.global_limit(mpid, mname),
+                        "price_usd": self.price_for(mpid, mname),
+                        "think": efforts.get(mpid, self.default_think_effort),
+                    }
+                )
+            conversations.append(
+                {
+                    "umo": umo,
+                    "label": self._conversation_label(umo, entry),
+                    "bot": bot,
+                    "platform": entry.get("platform") or "",
+                    "private": bool(entry.get("private")),
+                    "sender": entry.get("sender") or "",
+                    "users": len(users),
+                    "last_seen": int(entry.get("ts") or 0),
+                    "last_seen_ago": max(now - int(entry.get("ts") or 0), 0),
+                    "provider_id": pid,
+                    "model": self._display_name(pid, model_name) if pid else "",
+                    "think": efforts.get(pid, self.default_think_effort) if pid else "",
+                    "peak": self.peak_state_label(pid, model_name) if pid else "",
+                    "personal_total_usd": round(personal_total, 6),
+                    "models": models,
+                }
+            )
+
+        catalog = []
+        for pid, mname in catalog_items:
+            catalog.append(
+                {
+                    "provider_id": pid,
+                    "name": self._display_name(pid, mname),
+                    "price_usd": self.price_for(pid, mname),
+                    "base_price_usd": self.base_price_for(pid, mname),
+                    "peak": self.has_peak_pricing(pid, mname),
+                    "think": efforts.get(pid, self.default_think_effort),
+                    "user_limit_usd": self.user_model_limit(pid, mname),
+                    "pool_limit_usd": self.global_limit(pid, mname),
+                }
+            )
+
+        return {
+            "date": data.get("date", ""),
+            "rate": self.rate,
+            "now": now,
+            "limits": {
+                "user_total_usd": self.default_user_total_quota,
+                "user_model_default_usd": self.default_user_model_quota,
+                "pool_default_usd": self.default_global_quota,
+            },
+            "think_levels": list(self.think_levels),
+            "think_admin_only": self.think_admin_only,
+            "peak_note": self._peak_summary_note(include_models=False),
+            "opencode_only": bool(self.opencode_only_models and self._preset_active()),
+            "conversations": conversations,
+            "catalog": catalog,
+        }
+
+    async def _provider_of_umo(self, umo: str):
+        try:
+            return await self.context.get_using_provider_async(umo=umo)
+        except Exception:
+            return None
+
+    async def web_overview(self):
+        """GET：模型 / 思考强度 / 额度总览。"""
+        from astrbot.api.web import json_response
+
+        return json_response(await self._snapshot())
+
+    async def web_reset(self):
+        """POST {provider_id, umo?, scope?}：重置某模型的额度用量。
+
+        scope: conversation（默认，只清该对话）| bot（清该 bot 上所有对话）
+        """
+        from astrbot.api.web import error_response, json_response, request
+
+        payload = await request.json(default={})
+        provider_id = str(payload.get("provider_id") or "").strip()
+        if not provider_id:
+            return error_response("provider_id 不能为空", status_code=400)
+        scope = str(payload.get("scope") or "conversation").strip().lower()
+        umo = str(payload.get("umo") or "").strip()
+        if scope not in ("conversation", "bot"):
+            return error_response("scope 只能是 conversation 或 bot", status_code=400)
+        if scope == "conversation" and not umo:
+            return error_response("scope=conversation 时必须提供 umo", status_code=400)
+
+        data = await self._load_usage()
+        if scope == "conversation":
+            bot = None
+            convs = await self._load_conversations()
+            entry = convs.get(umo)
+            if isinstance(entry, dict):
+                bot = str(entry.get("bot") or "") or None
+            users, buckets = self.reset_model_usage(
+                data, provider_id, bot=bot, umo=umo
+            )
+        else:
+            users, buckets = self.reset_model_usage(data, provider_id)
+        await self._save_usage(data)
+        logger.info(
+            f"model_quota: 页面重置 {provider_id}（scope={scope}），"
+            f"涉及 {users} 人 / {buckets} 个桶"
+        )
+        return json_response(
+            {"reset": provider_id, "scope": scope, "users": users, "buckets": buckets}
+        )
+
+    async def web_set_think(self):
+        """POST {provider_id, level}：设置某模型的思考强度。"""
+        from astrbot.api.web import error_response, json_response, request
+
+        payload = await request.json(default={})
+        provider_id = str(payload.get("provider_id") or "").strip()
+        level = str(payload.get("level") or "").strip().lower()
+        if not provider_id:
+            return error_response("provider_id 不能为空", status_code=400)
+        if level and level not in self.think_levels and level != "reset":
+            return error_response(f"不支持的级别：{level}", status_code=400)
+        efforts = await self._load_think_efforts()
+        if level in ("", "reset"):
+            efforts.pop(provider_id, None)
+        else:
+            efforts[provider_id] = level
+        await self._save_think_efforts()
+        for provider in self._all_providers():
+            try:
+                if provider.meta().id == provider_id:
+                    await self._apply_think_effort(provider, provider_id)
+            except Exception:  # noqa: BLE001
+                continue
+        return json_response({"provider_id": provider_id, "level": level})
 
     async def terminate(self):
         """卸载时无需清理外部资源。"""
