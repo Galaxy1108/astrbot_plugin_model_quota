@@ -151,7 +151,7 @@ _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 _QUOTA_POOL_DIVISOR = 15.0
 """总池换算：官方月额度 ÷ 15，即 $15→$1、$30→$2、$60→$4。"""
 
-_QUOTA_PRESET_DEFAULT_TOTAL = 2.0
+_QUOTA_PRESET_DEFAULT_TOTAL = 1.5
 """限额预设下每人每天消费总额度（美元）。"""
 
 
@@ -281,7 +281,8 @@ class ModelQuotaPlugin(Star):
             cfg.get("model_user_quotas_usd", {})
         )
         self.default_user_total_quota: float = self._to_float(
-            cfg.get("default_user_total_quota_usd", 2.0), 2.0
+            cfg.get("default_user_total_quota_usd", _QUOTA_PRESET_DEFAULT_TOTAL),
+            _QUOTA_PRESET_DEFAULT_TOTAL,
         )
         self.default_global_quota: float = self._to_float(
             cfg.get("default_global_quota_usd", _QUOTA_PRESET_DEFAULT_GLOBAL),

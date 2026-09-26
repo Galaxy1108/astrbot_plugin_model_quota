@@ -118,9 +118,9 @@
   },
   "default_user_total_quota_usd": {
     "description": "每人每天全部模型的消费总额度（美元）",
-    "hint": "一个人在所有模型上的当日总花费上限。默认 2 美元。0 或负数表示不限。",
+    "hint": "一个人在所有模型上的当日总花费上限。默认 1.5 美元。0 或负数表示不限。",
     "type": "float",
-    "default": 2.0
+    "default": 1.5
   },
   "default_global_quota_usd": {
     "description": "每 bot 每模型每日总池默认值（美元，未命中预设时用）",
