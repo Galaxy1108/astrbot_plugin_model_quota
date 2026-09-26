@@ -8,7 +8,7 @@ desc: >-
   按模型全用户每日总限额；管理员默认免限额且不计数。超限自动拦截并提示。
 version: 1.2.0
 author: Galaxy1108
-repo: ""
+repo: https://github.com/Galaxy1108/astrbot_plugin_model_quota
 astrbot_version: ">=4.5.7"
 tags:
   - 模型切换
