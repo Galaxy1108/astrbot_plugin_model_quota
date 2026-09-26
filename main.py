@@ -1380,8 +1380,10 @@ class ModelQuotaPlugin(Star):
     def _find_provider(self, token: str) -> tuple[int, str, str] | None:
         """在开放自选的模型中查找，返回 (序号, id, model)。
 
-        匹配顺序：序号（1 起）> 提供商 ID（忽略大小写）> 显示名（忽略大小写，
-        模型名带空格也能匹配，调用方需用 GreedyStr 接参）。
+        匹配顺序：序号（1 起）> 提供商 ID > 显示名 > 底层模型名，
+        后三者都忽略大小写、也忽略空格与下划线/短横线的差异，
+        所以 ``/model 2``、``/model Kimi K3``、``/model gpt-6-luna`` 都能用
+        （调用方需用 GreedyStr 接参，才能拿到带空格的完整名称）。
         """
         items = self._provider_list(selectable_only=True)
         token = (token or "").strip()
@@ -1391,12 +1393,24 @@ class ModelQuotaPlugin(Star):
                 pid, model = items[idx - 1]
                 return idx, pid, model
             return None
+
         lowered = token.lower()
+        loose = self._norm_name(token)
+
+        def match(candidate: str) -> bool:
+            if not candidate:
+                return False
+            text = str(candidate)
+            return text.lower() == lowered or self._norm_name(text) == loose
+
         for i, (pid, model) in enumerate(items, start=1):
-            if pid == token or pid.lower() == lowered:
+            if match(pid):
                 return i, pid, model
         for i, (pid, model) in enumerate(items, start=1):
-            if self._display_name(pid, model).lower() == lowered:
+            if match(self._display_name(pid, model)):
+                return i, pid, model
+        for i, (pid, model) in enumerate(items, start=1):
+            if match(model):
                 return i, pid, model
         return None
 

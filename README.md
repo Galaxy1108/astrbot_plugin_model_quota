@@ -102,7 +102,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `/model`（别名 `/模型`） | 开放自选的模型列表（带单价）、当前模型（`*`）、自己今日剩余额度 |
 | `/model list` | 同上 |
 | `/model use <序号\|ID>` | 切换当前对话的模型，例：`/model use 2`（序号按开放列表数） |
-| `/model 2`、`/model <名称>` | 快捷切换写法（名称带空格可直接写） |
+| `/model <序号\|名称\|ID>` | 快捷切换（`/model 2`、`/model Kimi K3`、`/model gpt-6-luna` 都可以；名称带空格也能直接写） |
 | `/think` | 查看或修改当前模型的思考强度 |
 | `/quota` | 查看自己今日剩余额度（原 `/model me` 已移除，用这个） |
 
