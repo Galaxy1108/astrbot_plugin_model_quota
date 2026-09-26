@@ -31,6 +31,24 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | MiMo-V2.6-Flash | $60 | $0.0004 |
 | Space Bunny Free | 限时免费 | $0（免费） |
 
+### 排除跑不通的模型（`unselectable_models`，黑名单）
+
+有些模型可能因为**协议/地区/上游**原因用不了，把它们填进 `unselectable_models`
+即可从 `/model` 列表、切换与插件页面里彻底移除（按提供商 ID 或模型名匹配，
+忽略大小写与空格/短横线差异）：
+
+```json
+["gpt-6-luna", "gpt-5.6-luna", "grok-4.6", "grok-4.7",
+ "muse-spark-1.2-contributor", "muse-spark-1.3-contributor"]
+```
+
+> 常见坑：OpenCode Go 一个 key 底下混了**三种协议**，AstrBot 一个 provider 只能有一种类型，
+> 所以需要建多个 provider 指向同一个 `api_base`：
+> `openai_chat_completion`（GLM/Kimi/DeepSeek/MiMo/Hy/LongCat/Space Bunny）、
+> `openai_responses`（GPT 6 / GPT 5.6 Luna、Grok 4.6/4.7、Muse Spark）、
+> `anthropic_chat_completion`（MiniMax、Qwen3.x）。
+> 协议不匹配会报 400 `ModelProtocolUnsupported`。
+
 ### 只用 OpenCode 的模型（`opencode_only_models`，默认开启）
 
 预设开启时，`/model` 列表、切换与插件页面**只包含 OpenCode 提供商的模型**：
@@ -204,6 +222,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `admin_exempt` | true | 管理员免限额且不计数（不占总池） |
 | `opencode_only_models` | true | 预设下只展示 OpenCode 提供商的模型 |
 | `opencode_api_base_match` | `opencode.ai` | 判定 OpenCode 提供商的 api_base 关键字 |
+| `unselectable_models` | `[]` | **黑名单**：排除跑不通的模型（填 ID 或模型名即可） |
 | `think_enabled` | true | 启用 `/think` 思考强度命令 |
 | `think_admin_only` | true | 思考强度仅管理员可改（普通用户仍可查看） |
 | `think_levels` | `["off","minimal","low","medium","high","max"]` | 允许的级别（`off` 写成 API 的 `none`） |

@@ -246,7 +246,14 @@ class ModelQuotaPlugin(Star):
             if isinstance(raw_selectable, list)
             else []
         )
+        raw_unselectable = cfg.get("unselectable_models", [])
+        self.unselectable_models: set[str] = (
+            {self._norm_name(str(x)) for x in raw_unselectable if str(x).strip()}
+            if isinstance(raw_unselectable, list)
+            else set()
+        )
         self._warned_unknown_selectable = False
+        self._warned_unselectable = False
         raw_names = cfg.get("model_display_names", {})
         self.model_display_names: dict[str, str] = (
             {str(k): str(v) for k, v in raw_names.items()}
@@ -1272,6 +1279,43 @@ class ModelQuotaPlugin(Star):
                             "在当前提供商中不存在，已忽略"
                         )
             provs = [p for p in provs if p.meta().id in self.selectable_models]
+        if self.unselectable_models:
+            def _excluded(p) -> bool:
+                try:
+                    meta = p.meta()
+                except Exception:  # noqa: BLE001
+                    return False
+                return bool(
+                    {
+                        self._norm_name(meta.id),
+                        self._norm_name(meta.model or ""),
+                    }
+                    & self.unselectable_models
+                )
+
+            kept = [p for p in provs if not _excluded(p)]
+            if not self._warned_unselectable:
+                self._warned_unselectable = True
+                if len(kept) != len(provs):
+                    logger.info(
+                        f"model_quota: unselectable_models 已排除 "
+                        f"{len(provs) - len(kept)} 个模型"
+                    )
+                known = set()
+                for p in provs:
+                    try:
+                        meta = p.meta()
+                    except Exception:  # noqa: BLE001
+                        continue
+                    known.add(self._norm_name(meta.id))
+                    known.add(self._norm_name(meta.model or ""))
+                for name in self.unselectable_models - known:
+                    logger.warning(
+                        f"model_quota: unselectable_models 中的 {name!r} "
+                        "没有匹配到任何模型，已忽略"
+                    )
+            provs = kept
+
         if self.opencode_only_models and self._preset_active():
             oc = [p for p in provs if self.is_opencode_provider(p)]
             if oc:
