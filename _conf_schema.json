@@ -12,6 +12,13 @@
     "items": {},
     "default": {}
   },
+  "pricing_preset": {
+    "description": "内置单价预设",
+    "hint": "opencode_go：按 OpenCode Go 官方价目表（每月额度 ÷ 每月预估请求数）自动换算单次单价，峰谷模型已内置；off：只用下面手填的单价。显式填写的单价优先级更高。",
+    "type": "string",
+    "options": ["opencode_go", "off"],
+    "default": "opencode_go"
+  },
   "default_call_price_usd": {
     "description": "模型单次调用默认单价（美元）",
     "hint": "对所有未单独配置单价的模型生效。0 表示免费，该模型不受金额限额约束。",
@@ -19,8 +26,51 @@
     "default": 0.0
   },
   "model_call_prices_usd": {
-    "description": "按模型覆盖单次调用单价（美元）",
-    "hint": "key 为 WebUI「模型服务」中的提供商 ID，value 为每次对话的美元单价。只对配置了单价的模型做金额限额。",
+    "description": "按模型覆盖单次调用单价（美元，低谷价）",
+    "hint": "key 为提供商 ID，value 为每次对话的美元单价（低谷价）。留空则用上面的预设自动换算。参考 OpenCode Go 换算值：Kimi K3 $0.0306、GPT 5.6 Luna $0.0015、GLM-5.2 $0.0140、DeepSeek V4 Pro $0.00288（低谷）。",
+    "type": "dict",
+    "items": {},
+    "default": {}
+  },
+  "peak_pricing_enabled": {
+    "description": "启用峰谷定价",
+    "hint": "峰时单价 = 低谷价 × 下面的倍数。OpenCode Go 中 DeepSeek 系列（V4.1 Flash / V4 Pro / V4 Flash / V4 Flash Vision Exp）峰时翻倍。",
+    "type": "bool",
+    "default": true
+  },
+  "peak_multiplier": {
+    "description": "峰时价格倍数",
+    "hint": "峰时按低谷价乘以此倍数计费，官方 DeepSeek 系列为 2。",
+    "type": "float",
+    "default": 2.0
+  },
+  "peak_windows": {
+    "description": "峰时区间（HH:MM-HH:MM，可填多个）",
+    "hint": "按下面时区解释，支持跨天如 22:00-02:00。官方 DeepSeek 峰时为周一至五 01:00-04:00 与 06:00-10:00 UTC（即北京时间 09:00-12:00、14:00-18:00）。",
+    "type": "list",
+    "default": ["01:00-04:00", "06:00-10:00"]
+  },
+  "peak_timezone_offset": {
+    "description": "峰时区偏移（小时，UTC 为 0）",
+    "hint": "官方文档按 UTC 给峰时区间，默认 0；若想直接按北京时间填区间，则此项填 8 并把 peak_windows 写成 09:00-12:00 与 14:00-18:00。",
+    "type": "float",
+    "default": 0.0
+  },
+  "peak_weekdays_only": {
+    "description": "仅工作日有峰时（周末全天低谷）",
+    "hint": "官方规则：周末全天为低谷期。",
+    "type": "bool",
+    "default": true
+  },
+  "peak_models": {
+    "description": "额外参与峰谷定价的模型（提供商 ID 或模型名）",
+    "hint": "内置预设里的 DeepSeek 系列已自动包含，无需重复填写；这里用于你自己新增的峰谷模型。",
+    "type": "list",
+    "default": []
+  },
+  "model_peak_prices_usd": {
+    "description": "按模型直接指定峰时单价（美元，可选）",
+    "hint": "填了就优先于「低谷价 × 倍数」；key 为提供商 ID 或模型名。",
     "type": "dict",
     "items": {},
     "default": {}

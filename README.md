@@ -9,8 +9,39 @@
 2. 重启 AstrBot（或在 WebUI 插件页重载）；
 3. 在 WebUI「插件」中找到本插件，先配置各模型的**单次调用单价（美元）**，再设限额。
 
-> 计费方式：按次计费。一次唤起 AI 的对话 = 1 次调用 = 扣一个单价。
-> 没有配置单价（0）的模型视为免费，不受金额限额约束（次数仍统计展示）。
+计费方式：按次计费。一次唤起 AI 的对话 = 1 次调用 = 扣一次单价。
+单价可以手填，也可以直接用内置的 **OpenCode Go 价目预设**自动换算
+（每月额度 ÷ 每月预估请求数），无需逐个填。单价为 0 的模型视为免费。
+
+### 内置单价预设（`pricing_preset: opencode_go`，默认开启）
+
+按 [OpenCode Go 官方价目](https://opencode.ai/docs/zh-cn/go/) 换算成「单次对话」成本，
+覆盖 Kimi K3、GPT 5.6 Luna、GLM-5.x、Qwen3.x、DeepSeek V4 系列、Grok 4.x、
+MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模型。
+按模型名自动匹配（大小写/空格/`opencode-go/` 前缀都能认），例如：
+
+| 模型 | 每月额度 | 单次单价（低谷） |
+|---|---|---|
+| Kimi K3 | $15 | $0.0306 |
+| GLM-5.2 / GLM-5.1 | $60 | $0.0140 |
+| Qwen3.8 Max | $15 | $0.0185 |
+| DeepSeek V4 Pro | $15 | $0.00288 |
+| DeepSeek V4.1 Flash | $60 | $0.00046 |
+| GPT 5.6 Luna | $15 | $0.0015 |
+| MiMo-V2.6-Flash | $60 | $0.0004 |
+| Space Bunny Free | 限时免费 | $0（免费） |
+
+### 峰谷定价（`peak_pricing_enabled`，默认开启）
+
+官方仅 DeepSeek 系列有峰谷，**峰时价格为低谷的 2×**：
+
+- 峰时：周一至周五 `01:00-04:00`、`06:00-10:00`（UTC，即北京时间 `09:00-12:00`、`14:00-18:00`）
+- 低谷：其余时段 + 整个周末
+
+插件在每次调用前按当时的时段取价并计费，卡片与列表会显示
+`谷时（峰时 2×）` / `峰时 2×（当前）`。想按北京时间填区间，
+把 `peak_timezone_offset` 设成 `8`、`peak_windows` 写成 `["09:00-12:00","14:00-18:00"]` 即可。
+自建模型要参与峰谷，写进 `peak_models`；也可用 `model_peak_prices_usd` 直接指定峰时单价。
 
 ## 用户指令
 
@@ -72,8 +103,16 @@
 |---|---|---|
 | `selectable_models` | `[]` | **允许自选的模型白名单（提供商 ID 列表）**，例 `["vip", "default"]`；留空=全部可用；`/model` 列表与切换只认这里 |
 | `model_display_names` | `{}` | **模型显示名映射**，例 `{"default": "Kimi K3", "vip": "GPT 5.6 Luna"}`；列表、卡片、额度、提示全部只显示真实模型名，ID 藏起来；切换用序号或名称（名称带空格可直接写，如 `/model use GPT 5.6 Luna`） |
+| `pricing_preset` | opencode_go | 内置单价预设：`opencode_go` 自动按官方价目换算；`off` 只用下面手填的 |
 | `default_call_price_usd` | 0 | 单次调用默认单价；0=免费不限 |
-| `model_call_prices_usd` | `{}` | 按模型单价，例 `{"vip": 0.05}`（一次对话 5 美分） |
+| `model_call_prices_usd` | `{}` | 按模型覆盖单价（低谷价），优先级高于预设；例 `{"vip": 0.05}` |
+| `peak_pricing_enabled` | true | 启用峰谷定价 |
+| `peak_multiplier` | 2.0 | 峰时价格倍数（官方 DeepSeek 为 2） |
+| `peak_windows` | `["01:00-04:00","06:00-10:00"]` | 峰时区间，可多个、支持跨天 |
+| `peak_timezone_offset` | 0 | 峰时区偏移（官方按 UTC，故默认 0；填 8 可用北京时间） |
+| `peak_weekdays_only` | true | 周末全天低谷 |
+| `peak_models` | `[]` | 额外参与峰谷的模型（预设里的 DeepSeek 已自动包含） |
+| `model_peak_prices_usd` | `{}` | 直接指定峰时单价，优先于「低谷价×倍数」 |
 | `default_user_model_quota_usd` | 1.0 | 每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
 | `default_user_total_quota_usd` | 2.0 | **每人每天全部模型消费总额度** |

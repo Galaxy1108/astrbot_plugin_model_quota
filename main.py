@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from astrbot.api import logger
@@ -47,6 +47,78 @@ _UNLIMITED = "不限"
 
 _EPS = 1e-9
 """浮点比较容差。"""
+
+# ----------------------------------------------------------------------
+# OpenCode Go 内置单价表（按次估算）
+#
+# 来源：https://opencode.ai/docs/zh-cn/go/ 的「每月限制」与「预估请求数」。
+# 单次单价 = 每月限额 ÷ 每月预估请求数，即把该套餐的额度换算成一次对话的成本。
+# 峰谷定价：DeepSeek 系列峰时（周一至五 01:00-04:00、06:00-10:00 UTC）价格为 2×，
+# 其余时段（含周末）为低谷价；表中数值为低谷价。
+# ----------------------------------------------------------------------
+_OPENCODE_GO_PRICES: dict[str, float] = {
+    "glm-5.3-flash": 60 / 31580,
+    "glm-5.3": 15 / 1080,
+    "glm-5.2": 60 / 4300,
+    "glm-5.1": 60 / 4300,
+    "kimi-k3": 15 / 490,
+    "kimi-k2.7-code": 60 / 6750,
+    "kimi-k2.6": 60 / 5750,
+    "longcat-2.0": 60 / 57200,
+    "mimo-v2.6-flash": 60 / 150400,
+    "mimo-v2.6-pro": 15 / 16300,
+    "mimo-v2.5": 60 / 150400,
+    "mimo-v2.5-pro": 15 / 16300,
+    "minimax-m3": 60 / 16000,
+    "minimax-m2.7": 60 / 17000,
+    "minimax-m2.5": 60 / 17000,
+    "muse-spark-1.3-contributor": 60 / 226600,
+    "muse-spark-1.2-contributor": 60 / 226600,
+    "qwen3.8-max": 15 / 810,
+    "qwen3.8-flash": 30 / 27000,
+    "qwen3.7-max": 30 / 840,
+    "qwen3.7-plus": 60 / 21600,
+    "qwen3.6-plus": 60 / 16300,
+    "deepseek-v4.1-flash": 60 / 130000,
+    "deepseek-v4-pro": 15 / 5200,
+    "deepseek-v4-flash": 30 / 65000,
+    "deepseek-v4-flash-vision-exp": 15 / 32500,
+    "hy4-preview": 30 / 6770,
+    "hy3": 60 / 21500,
+    "grok-4.7": 15 / 845,
+    "grok-4.6": 15 / 845,
+    "gpt-6-luna": 15 / 21130,
+    "gpt-5.6-luna": 15 / 10250,
+    "space-bunny-free": 0.0,
+}
+"""模型名（规范化后）-> 低谷期单次调用单价（美元）。"""
+
+_OPENCODE_GO_PEAK_MODELS: frozenset[str] = frozenset(
+    {
+        "deepseek-v4.1-flash",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-vision-exp",
+    }
+)
+"""内置表中参与峰谷定价的模型（DeepSeek 系列）。"""
+
+_OPENCODE_GO_MONTHLY_LIMITS: dict[str, float] = {
+    "glm-5.3-flash": 60, "glm-5.3": 15, "glm-5.2": 60, "glm-5.1": 60,
+    "kimi-k3": 15, "kimi-k2.7-code": 60, "kimi-k2.6": 60, "longcat-2.0": 60,
+    "mimo-v2.6-flash": 60, "mimo-v2.6-pro": 15, "mimo-v2.5": 60,
+    "mimo-v2.5-pro": 15, "minimax-m3": 60, "minimax-m2.7": 60,
+    "minimax-m2.5": 60, "muse-spark-1.3-contributor": 60,
+    "muse-spark-1.2-contributor": 60, "qwen3.8-max": 15, "qwen3.8-flash": 30,
+    "qwen3.7-max": 30, "qwen3.7-plus": 60, "qwen3.6-plus": 60,
+    "deepseek-v4.1-flash": 60, "deepseek-v4-pro": 15, "deepseek-v4-flash": 30,
+    "deepseek-v4-flash-vision-exp": 15, "hy4-preview": 30, "hy3": 60,
+    "grok-4.7": 15, "grok-4.6": 15, "gpt-6-luna": 15, "gpt-5.6-luna": 15,
+}
+"""OpenCode Go 各模型的每月额度（美元），用于文档与月→日换算参考。"""
+
+PRICING_PRESET_OPENCODE_GO = "opencode_go"
+"""内置单价预设名。"""
 
 # 进度条字形：与 opencode 用量插件（/ocgo）同款，GBK 安全。
 BAR_WIDTH = 10
@@ -113,6 +185,33 @@ class ModelQuotaPlugin(Star):
         )
         self.model_prices: dict[str, float] = self._to_float_map(
             cfg.get("model_call_prices_usd", {})
+        )
+        self.pricing_preset: str = (
+            str(cfg.get("pricing_preset", PRICING_PRESET_OPENCODE_GO) or "")
+            .strip()
+            .lower()
+        )
+        # 峰谷定价
+        self.peak_enabled: bool = bool(cfg.get("peak_pricing_enabled", True))
+        self.peak_multiplier: float = self._to_float(
+            cfg.get("peak_multiplier", 2.0), 2.0
+        )
+        if self.peak_multiplier <= 0:
+            self.peak_multiplier = 2.0
+        raw_windows = cfg.get("peak_windows", ["01:00-04:00", "06:00-10:00"])
+        self.peak_windows: list[tuple[int, int]] = self._parse_windows(raw_windows)
+        self.peak_tz_offset: float = self._to_float(
+            cfg.get("peak_timezone_offset", 0.0), 0.0
+        )
+        self.peak_weekdays_only: bool = bool(cfg.get("peak_weekdays_only", True))
+        raw_peak_models = cfg.get("peak_models", [])
+        self.peak_models: set[str] = (
+            {self._norm_name(str(x)) for x in raw_peak_models}
+            if isinstance(raw_peak_models, list)
+            else set()
+        )
+        self.model_peak_prices: dict[str, float] = self._to_float_map(
+            cfg.get("model_peak_prices_usd", {})
         )
         self.default_user_model_quota: float = self._to_float(
             cfg.get("default_user_model_quota_usd", 1.0), 1.0
@@ -186,9 +285,186 @@ class ModelQuotaPlugin(Star):
             result[str(k)] = f
         return result
 
-    def price_for(self, provider_id: str) -> float:
-        """某模型单次调用单价（美元），0 表示免费。"""
-        return self.model_prices.get(provider_id, self.default_price)
+    def price_for(self, provider_id: str, model: str = "") -> float:
+        """当前时段单次调用单价（美元），0 表示免费。
+
+        优先级：model_call_prices_usd 显式配置 > 内置预设（按模型名匹配）>
+        default_call_price_usd。峰谷定价在低谷价基础上乘 peak_multiplier。
+        """
+        base = self.base_price_for(provider_id, model)
+        if base <= 0:
+            return base
+        if self.is_peak_now(provider_id, model):
+            override = self._peak_price_override(provider_id, model)
+            if override is not None:
+                return override
+            return base * self.peak_multiplier
+        return base
+
+    def base_price_for(self, provider_id: str, model: str = "") -> float:
+        """低谷期（基础）单价（美元）。"""
+        if provider_id in self.model_prices:
+            return self.model_prices[provider_id]
+        if self.pricing_preset == PRICING_PRESET_OPENCODE_GO:
+            hit = self._preset_lookup(provider_id, model)
+            if hit is not None:
+                return hit
+        return self.default_price
+
+    def _preset_lookup(self, provider_id: str, model: str) -> float | None:
+        """在内置 OpenCode Go 表中按模型名/ID 匹配。"""
+        for candidate in (model, provider_id):
+            key = self._norm_name(candidate)
+            if not key:
+                continue
+            if key in _OPENCODE_GO_PRICES:
+                return _OPENCODE_GO_PRICES[key]
+            # 宽松匹配：去掉 - . 空格后比较（"Kimi K3" == "kimi-k3"）
+            loose = key.replace("-", "").replace(".", "")
+            for name, price in _OPENCODE_GO_PRICES.items():
+                if name.replace("-", "").replace(".", "") == loose:
+                    return price
+        return None
+
+    @staticmethod
+    def _norm_name(value: str) -> str:
+        """规范化模型名：小写、去 opencode-go/ 前缀、空格与下划线转连字符。"""
+        text = (value or "").strip().lower()
+        if "/" in text:
+            text = text.rsplit("/", 1)[-1]
+        return text.replace(" ", "-").replace("_", "-")
+
+    def _preset_key(self, provider_id: str, model: str) -> str | None:
+        """取得该模型在内置表中的规范键（用于峰谷判断）。"""
+        for candidate in (model, provider_id):
+            key = self._norm_name(candidate)
+            if key in _OPENCODE_GO_PRICES:
+                return key
+            loose = key.replace("-", "").replace(".", "")
+            for name in _OPENCODE_GO_PRICES:
+                if name.replace("-", "").replace(".", "") == loose:
+                    return name
+        return None
+
+    def has_peak_pricing(self, provider_id: str, model: str = "") -> bool:
+        """该模型是否参与峰谷定价。"""
+        if self._peak_price_override(provider_id, model) is not None:
+            return True
+        key = self._preset_key(provider_id, model)
+        if key and key in _OPENCODE_GO_PEAK_MODELS:
+            return True
+        # peak_models 里写提供商 ID 或模型名都算命中
+        return bool(
+            {self._norm_name(model), self._norm_name(provider_id)} & self.peak_models
+        )
+
+    def _peak_price_override(self, provider_id: str, model: str) -> float | None:
+        """显式配置的峰时单价（model_peak_prices_usd），没有则返回 None。"""
+        if provider_id in self.model_peak_prices:
+            return self.model_peak_prices[provider_id]
+        for candidate in (model, provider_id):
+            key = self._norm_name(candidate)
+            if key and key in self.model_peak_prices:
+                return self.model_peak_prices[key]
+        return None
+
+    @staticmethod
+    def _parse_windows(raw: object) -> list[tuple[int, int]]:
+        """把 ["01:00-04:00", ...] 解析成 [(分钟起点, 分钟终点), ...]，跨天允许。"""
+        windows: list[tuple[int, int]] = []
+        if not isinstance(raw, list):
+            return windows
+        for item in raw:
+            text = str(item or "").strip()
+            if "-" not in text:
+                logger.warning(f"model_quota: 峰时区间 {text!r} 格式不对，应为 HH:MM-HH:MM")
+                continue
+            left, _, right = text.partition("-")
+            try:
+                sh, sm = (int(x) for x in left.strip().split(":"))
+                eh, em = (int(x) for x in right.strip().split(":"))
+            except (TypeError, ValueError):
+                logger.warning(f"model_quota: 峰时区间 {text!r} 解析失败，已忽略")
+                continue
+            start = (sh % 24) * 60 + (sm % 60)
+            end = (eh % 24) * 60 + (em % 60)
+            windows.append((start, end))
+        return windows
+
+    def is_peak_now(self, provider_id: str, model: str = "") -> bool:
+        """当前是否处于峰时（该模型参与峰谷定价时才可能为真）。"""
+        if not self.peak_enabled or not self.peak_windows:
+            return False
+        if not self.has_peak_pricing(provider_id, model):
+            return False
+        if self.peak_weekdays_only and datetime.now(
+            timezone(timedelta(hours=self.peak_tz_offset))
+        ).weekday() >= 5:
+            return False  # 周末全为低谷
+        local = datetime.now(timezone(timedelta(hours=self.peak_tz_offset)))
+        minutes = local.hour * 60 + local.minute
+        for start, end in self.peak_windows:
+            if start <= end:
+                if start <= minutes < end:
+                    return True
+            elif minutes >= start or minutes < end:  # 跨天区间
+                return True
+        return False
+
+    def peak_state_label(self, provider_id: str, model: str = "") -> str:
+        """当前时段的展示文案。"""
+        if not self.has_peak_pricing(provider_id, model):
+            return ""
+        if not self.peak_enabled or not self.peak_windows:
+            return ""
+        if self.is_peak_now(provider_id, model):
+            return f"峰时 {self.peak_multiplier:g}×"
+        return "谷时 1×"
+
+    def _peak_note_lines(self) -> list[str]:
+        """文本输出里附一行峰谷状态（无峰谷模型时为空）。"""
+        note = self._peak_summary_note()
+        return [f"🕐 {note}"] if note else []
+
+    def _peak_summary_note(self, include_models: bool = True) -> str:
+        """峰谷总览文案。
+
+        Args:
+            include_models: 是否附上适用的模型名（聊天文本用 True；
+                卡片里因为每个模型自带峰谷标注，用 False 更简洁）。
+        """
+        if not self.peak_enabled or not self.peak_windows:
+            return ""
+        window_text = "、".join(
+            f"{s // 60:02d}:{s % 60:02d}-{e // 60:02d}:{e % 60:02d}"
+            for s, e in self.peak_windows
+        )
+        tz_sign = "+" if self.peak_tz_offset >= 0 else "-"
+        tz_text = f"UTC{tz_sign}{abs(self.peak_tz_offset):g}"
+        day_text = "周一至五" if self.peak_weekdays_only else "每天"
+        peak_models = [
+            (pid, model)
+            for pid, model in self._provider_list(selectable_only=True)
+            if self.has_peak_pricing(pid, model)
+        ]
+        peak_now = any(self.is_peak_now(pid, model) for pid, model in peak_models)
+        state = "峰时" if peak_now else "谷时"
+        note = f"当前{state}；峰时 {self.peak_multiplier:g}×（{day_text} {window_text} {tz_text}）"
+        if include_models and peak_models:
+            names = [self._display_name(pid, model) for pid, model in peak_models]
+            shown = "、".join(names[:3]) + ("等" if len(names) > 3 else "")
+            note += f"，适用：{shown}"
+        return note
+
+    def peak_row_suffix(self, provider_id: str, model: str = "") -> str:
+        """卡片行尾的峰谷标注，如「 · 峰时2×（当前）」。"""
+        if not self.peak_enabled or not self.peak_windows:
+            return ""
+        if not self.has_peak_pricing(provider_id, model):
+            return ""
+        if self.is_peak_now(provider_id, model):
+            return f" · 峰时 {self.peak_multiplier:g}×（当前）"
+        return f" · 谷时（峰时 {self.peak_multiplier:g}×）"
 
     def user_model_limit(self, provider_id: str) -> float:
         """某模型每人每日限额（美元，<=0 不限）。"""
@@ -309,7 +585,7 @@ class ModelQuotaPlugin(Star):
                 if isinstance(spent, dict):
                     for pid, v in spent.items():
                         if isinstance(v, (int, float)) and v > 0:
-                            total[pid] = round(total.get(pid, 0.0) + v, 6)
+                            total[pid] = round(total.get(pid, 0.0) + v, 10)
                 cnt = info.get("counts", {})
                 if isinstance(cnt, dict):
                     for pid, n in cnt.items():
@@ -338,8 +614,9 @@ class ModelQuotaPlugin(Star):
             return
 
         pid = provider.meta().id
-        price = self.price_for(pid)
-        disp = self._display_name(pid, provider.meta().model or "")
+        model_name = provider.meta().model or ""
+        price = self.price_for(pid, model_name)
+        disp = self._display_name(pid, model_name)
 
         if self.admin_exempt and event.is_admin():
             return  # 管理员免限额且不计数
@@ -397,9 +674,9 @@ class ModelQuotaPlugin(Star):
             else 1
         )
         if price > 0:
-            spent[pid] = round(spent_m + price, 6)
-            info["total"] = round(total + price, 6)
-            data["global"][pid] = round(gspent + price, 6)
+            spent[pid] = round(spent_m + price, 10)
+            info["total"] = round(total + price, 10)
+            data["global"][pid] = round(gspent + price, 10)
         await self._save_usage(data)
 
     # ------------------------------------------------------------------
@@ -474,7 +751,7 @@ class ModelQuotaPlugin(Star):
         """
         lines: list[str] = []
         for pid, model in self._provider_list(selectable_only=True):
-            price = self.price_for(pid)
+            price = self.price_for(pid, model)
             title = self._display_name(pid, model)
             used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
             spent_m = self._num(spent, pid)
@@ -499,7 +776,7 @@ class ModelQuotaPlugin(Star):
                     f"- {title} {self._bar(pct)} {pct:>3.0f}% "
                     f"已花 {self.cny(spent_m)}/{self.cny(ulimit)}"
                     f"（{used_n} 次）剩 {self.cny(max(ulimit - spent_m, 0))}"
-                    f"{pool_suffix}"
+                    f"{pool_suffix}{self.peak_row_suffix(pid, model)}"
                 )
                 if exhausted:
                     line += f"  {LIMITED_MARK} 已用完"
@@ -507,7 +784,7 @@ class ModelQuotaPlugin(Star):
             else:
                 lines.append(
                     f"- {title}：已用 {used_n} 次·{self.cny(spent_m)}（个人不限）"
-                    f"{pool_suffix}"
+                    f"{pool_suffix}{self.peak_row_suffix(pid, model)}"
                 )
         return lines
 
@@ -557,17 +834,18 @@ class ModelQuotaPlugin(Star):
         """组装个人额度卡片行，只含开放自选的模型 + 个人总额行。"""
         rows: list[tuple[str, float, bool, str, str, float | None, str]] = []
         for pid, model in self._provider_list(selectable_only=True):
-            price = self.price_for(pid)
+            price = self.price_for(pid, model)
             label = self._display_name(pid, model)
             used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
             spent_m = self._num(spent, pid)
+            peak_note = self.peak_row_suffix(pid, model)
             if price <= 0:
                 rows.append(
                     (
                         label,
                         0.0,
                         False,
-                        f"免费·{_UNLIMITED}（已用 {used_n} 次）",
+                        f"免费·{_UNLIMITED}（已用 {used_n} 次）{peak_note}",
                         "",
                         None,
                         "",
@@ -592,6 +870,8 @@ class ModelQuotaPlugin(Star):
                     f"已花 {self.cny(spent_m)} / 上限 {self.cny(ulimit)}"
                     f"（{used_n} 次）"
                 )
+                if peak_note:
+                    sub_left += peak_note
                 if pool_sub:
                     sub_left += f" · {pool_sub}"
                 rows.append(
@@ -607,6 +887,8 @@ class ModelQuotaPlugin(Star):
                 )
             else:
                 sub_left = f"已用 {used_n} 次·{self.cny(spent_m)}（个人不限）"
+                if peak_note:
+                    sub_left += peak_note
                 if pool_sub:
                     sub_left += f" · {pool_sub}"
                 rows.append((label, 0.0, False, sub_left, "", pool_pct, ""))
@@ -687,8 +969,12 @@ class ModelQuotaPlugin(Star):
         name: str,
         subtitle: str,
         rows: list[tuple[str, float, bool, str, str, float | None, str]],
+        note: str = "",
     ) -> str | None:
-        """用 Pillow 绘制 /ocgo 同款额度卡片。返回图片路径，失败返回 None。
+        """用 Pillow 绘制额度卡片。返回图片路径，失败返回 None。
+
+        Args:
+            note: 右上区域的补充说明（如峰谷状态），单独一行展示。
 
         必须跑在 worker 线程（``asyncio.to_thread``），保持同步。
         """
@@ -743,13 +1029,27 @@ class ModelQuotaPlugin(Star):
             box = probe.textbbox((0, 0), text, font=font)
             return box[3] - box[1]
 
+        def fit(text: str, font, max_width: int) -> str:
+            """超宽则截断加省略号，避免文字被卡片右边缘裁掉。"""
+            if not text or probe.textlength(text, font=font) <= max_width:
+                return text
+            trimmed = text
+            while len(trimmed) > 1 and probe.textlength(
+                trimmed + "…", font=font
+            ) > max_width:
+                trimmed = trimmed[:-1]
+            return trimmed + "…"
+
         title_h = line_h("剩余额度", f_title)
         sub_h = line_h("个人额度 · 已用百分比", f_sub)
         meta_h = line_h("更新于 2000/00/00 00:00:00", f_meta)
         label_h = line_h("总池·provider", f_label)
         subline_h = line_h("已花 ¥000.00 / 上限 ¥000.00", f_small)
 
-        height = pad + title_h + 10 * scale + sub_h + 6 * scale + meta_h + 20 * scale
+        height = pad + title_h + 10 * scale + sub_h + 6 * scale + meta_h
+        if note:
+            height += 5 * scale + meta_h
+        height += 20 * scale
         for _label, _percent, _limited, _left, _right, _pool_pct, _pool in rows:
             height += label_h + gap_label_bar + bar_h
             if _pool_pct is not None:
@@ -776,6 +1076,12 @@ class ModelQuotaPlugin(Star):
 
         # 标题行：左标题，右用户名
         draw.text((pad, cursor), title, font=f_title, fill=COLOR_TITLE)
+        title_w = probe.textlength(title, font=f_title)
+        name = fit(
+            name,
+            f_sub,
+            int(width - pad * 2 - title_w - 16 * scale),
+        )
         name_w = probe.textlength(name, font=f_sub)
         draw.text(
             (width - pad - name_w, cursor + (title_h - sub_h)),
@@ -785,7 +1091,12 @@ class ModelQuotaPlugin(Star):
         )
         cursor += title_h + 10 * scale
 
-        draw.text((pad, cursor), subtitle, font=f_sub, fill=COLOR_MUTED)
+        draw.text(
+            (pad, cursor),
+            fit(subtitle, f_sub, width - pad * 2),
+            font=f_sub,
+            fill=COLOR_MUTED,
+        )
         cursor += sub_h + 6 * scale
 
         draw.text(
@@ -794,7 +1105,17 @@ class ModelQuotaPlugin(Star):
             font=f_meta,
             fill=COLOR_MUTED,
         )
-        cursor += meta_h + 20 * scale
+        cursor += meta_h
+        if note:
+            cursor += 5 * scale
+            draw.text(
+                (pad, cursor),
+                fit(f"峰谷：{note}", f_meta, width - pad * 2),
+                font=f_meta,
+                fill=COLOR_MUTED,
+            )
+            cursor += meta_h
+        cursor += 20 * scale
 
         track_w = width - pad * 2
         for label, percent, limited, sub_left, sub_right, pool_pct, _pool in rows:
@@ -913,12 +1234,14 @@ class ModelQuotaPlugin(Star):
             name = event.get_sender_name() or ""
         except Exception:
             name = ""
+        subtitle = f"个人额度 · 已用百分比（1$≈{self.cny(1)}）"
         card = await asyncio.to_thread(
             self._render_quota_card,
             "剩余额度",
             name,
-            f"个人额度 · 已用百分比（1$≈{self.cny(1)}）",
+            subtitle,
             rows,
+            self._peak_summary_note(include_models=False),
         )
         if card is None and self.quota_render == "image":
             logger.warning("model_quota: 图片渲染失败（缺 Pillow 或中文字体），已回退文本")
@@ -973,8 +1296,17 @@ class ModelQuotaPlugin(Star):
             lines = ["🤖 可选 AI 模型（* 为当前对话正在用）："]
             for i, (pid, model) in enumerate(items, start=1):
                 mark = " *" if pid == current else ""
-                price = self.price_for(pid)
-                fee = "免费" if price <= 0 else f"${price:.4f}/次"
+                base = self.base_price_for(pid, model)
+                if base <= 0:
+                    fee = "免费"
+                else:
+                    fee = f"${base:.4f}/次"
+                    if self.has_peak_pricing(pid, model) and self.peak_enabled:
+                        if self.is_peak_now(pid, model):
+                            fee += f"，当前峰时 {self.peak_multiplier:g}×"
+                            fee += f"（${base * self.peak_multiplier:.4f}）"
+                        else:
+                            fee += f"，谷时；峰时 ${base * self.peak_multiplier:.4f}"
                 lines.append(f"{i}. {self._display_name(pid, model)} [{fee}]{mark}")
             lines.append("")
             rem_lines = self._remaining_lines(
@@ -985,8 +1317,9 @@ class ModelQuotaPlugin(Star):
                 lines.extend(rem_lines)
                 lines.append(self._total_line(self._user_total(uinfo if isinstance(uinfo, dict) else {})))
                 lines.append(self._reset_line())
+                lines.extend(self._peak_note_lines())
                 lines.append("")
-            lines.append("切换：/model use <序号|ID>（例：/model use 2）")
+            lines.append("切换：/model use <序号|名称>（例：/model use 2）")
             if not event.is_private_chat():
                 lines.append("群聊中切换模型仅限管理员。")
             yield event.plain_result("\n".join(lines))
@@ -1016,6 +1349,7 @@ class ModelQuotaPlugin(Star):
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
             lines.append(self._total_line(total))
             lines.append(self._reset_line())
+            lines.extend(self._peak_note_lines())
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1054,7 +1388,7 @@ class ModelQuotaPlugin(Star):
                 return
             # 若目标模型额度已空，给出预警（仍允许切换）
             warn = ""
-            price = self.price_for(pid)
+            price = self.price_for(pid, model)
             if price > 0 and not (self.admin_exempt and event.is_admin()):
                 data = await self._load_usage()
                 ukey = self._user_key(event)
@@ -1073,14 +1407,15 @@ class ModelQuotaPlugin(Star):
                 tlimit = self.default_user_total_quota
                 glimit = self.global_limit(pid)
                 if ulimit > 0 and spent_m + price > ulimit + _EPS:
-                    warn = f"\n⚠️ 你在 {pid} 的今日额度已用完，切换后暂时无法用它对话。"
+                    warn = f"\n⚠️ 你在 {disp} 的今日额度已用完，切换后暂时无法用它对话。"
                 elif tlimit > 0 and total + price > tlimit + _EPS:
                     warn = "\n⚠️ 你的今日消费总额度已用完，切换后暂时无法用它对话。"
                 elif glimit > 0 and gspent + price > glimit + _EPS:
-                    warn = f"\n⚠️ {pid} 的全用户总限额已用完，切换后暂时无法用它对话。"
+                    warn = f"\n⚠️ {disp} 的全用户总限额已用完，切换后暂时无法用它对话。"
+            peak_note = self.peak_row_suffix(pid, model)
             scope = "本群会话" if not event.is_private_chat() else "当前私聊会话"
             yield event.plain_result(
-                f"✅ 已切换到 {idx}. {pid}{suffix}，对{scope}生效。{warn}"
+                f"✅ 已切换到 {idx}. {disp}，对{scope}生效。{peak_note}{warn}"
             )
             return
 
@@ -1134,6 +1469,7 @@ class ModelQuotaPlugin(Star):
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
             lines.append(self._total_line(total))
             lines.append(self._reset_line())
+            lines.extend(self._peak_note_lines())
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1159,7 +1495,7 @@ class ModelQuotaPlugin(Star):
                 gspent = self._num(gspent_map, pid)
                 gused_n = gcount_map.get(pid, 0)
                 lines.append(
-                    f"- {pid}{suffix}：单价 ${self.price_for(pid):.4f}/次，"
+                    f"- {pid}{suffix}：单价 ${self.price_for(pid, model):.4f}/次，"
                     f"总池已花 {self.cny(gspent)}/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
                     f"（{gused_n} 次），每人 {self._fmt_limit_usd(self.user_model_limit(pid), self.cny)}"
                 )
