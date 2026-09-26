@@ -122,9 +122,15 @@
     "type": "float",
     "default": 1.5
   },
+  "all_users_total_quota_usd": {
+    "description": "全用户每日最大总额（美元，本 bot 所有用户合计）",
+    "hint": "同一个 bot 上所有非管理员用户、所有模型加起来的上限，默认 2 美元。总池是按模型分的，这一条是跨模型的整体预算。0 或负数表示不限。",
+    "type": "float",
+    "default": 2.0
+  },
   "default_global_quota_usd": {
     "description": "每 bot 每模型每日总池默认值（美元，未命中预设时用）",
-    "hint": "OpenCode 预设下总池按官方月额度 ÷15 自动换算：$15→$1、$30→$2、$60→$4。这里只是未命中月额度表时的兜底值。总池按 bot 分开统计，多个 bot 各有一个独立总池。0 或负数表示不限。",
+    "hint": "OpenCode 预设下只有官方月额度 $15 的模型保留每模型总池 $1；$30/$60 档的额度远大于「全用户总额」，单设总池不会触发，改由全用户总额统一约束。这里只是未命中月额度表时的兜底值。总池按 bot 分开统计。0 或负数表示不限。",
     "type": "float",
     "default": 1.0
   },
@@ -206,5 +212,11 @@
     "hint": "占位符：{model} 模型ID、{used} 全用户已用次数、{spent} 总池已花(人民币)、{limit} 总上限(人民币)。",
     "type": "text",
     "default": "🈵 {model} 今天的全用户总限额已用完（已花 {spent}/{limit}），明天再来吧～也可以 /model 换个模型试试。"
+  },
+  "all_users_exhausted_tip": {
+    "description": "全用户总额用尽时的回复",
+    "hint": "占位符：{spent} 本 bot 全用户已花(人民币)、{limit} 总上限(人民币)。",
+    "type": "text",
+    "default": "🈵 今天本 bot 的全用户总额度已用完（已花 {spent}/{limit}），明天再来吧～"
   }
 }

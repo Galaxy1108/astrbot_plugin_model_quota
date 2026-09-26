@@ -148,8 +148,17 @@ QUOTA_PRESET_OPENCODE_GO = "opencode_go"
 _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 """限额预设下未命中月额度表时的总池默认值（美元）。"""
 
-_QUOTA_POOL_DIVISOR = 15.0
-"""总池换算：官方月额度 ÷ 15，即 $15→$1、$30→$2、$60→$4。"""
+_ALL_USERS_TOTAL_DEFAULT = 2.0
+"""全用户每日最大总额（本 bot 所有用户合计，美元）。"""
+
+_QUOTA_POOL_TIER_MONTHLY = 15.0
+"""保留每模型总池的档位：官方月额度 $15。"""
+
+_QUOTA_POOL_TIER_AMOUNT = 1.0
+"""$15 档模型的每 bot 总池（美元）。"""
+
+_QUOTA_POOL_UNLIMITED = 0.0
+"""其余档位不再单设总池：由「全用户总额」统一约束。"""
 
 _QUOTA_PRESET_DEFAULT_TOTAL = 1.5
 """限额预设下每人每天消费总额度（美元）。"""
@@ -166,7 +175,8 @@ class QuotaRow(NamedTuple):
         sub_right: 进度条下方右侧说明。
         pool_percent: 总池已用百分比；None 表示该行没有总池条。
         pool_sub: 总池说明（当前由 sub_left 承载，保留字段）。
-        thick: 是否使用加粗进度条（个人总额行使用）。
+        weight: 进度条粗细等级。0=普通模型行，1=中等（全用户总额），
+            2=最粗（个人总额）。
     """
 
     label: str
@@ -176,7 +186,12 @@ class QuotaRow(NamedTuple):
     sub_right: str
     pool_percent: float | None = None
     pool_sub: str = ""
-    thick: bool = False
+    weight: int = 0
+
+    @property
+    def thick(self) -> bool:
+        """兼容旧调用：是否使用加粗条。"""
+        return self.weight >= 2
 
 # 进度条字形：与 opencode 用量插件（/ocgo）同款，GBK 安全。
 BAR_WIDTH = 10
@@ -294,6 +309,10 @@ class ModelQuotaPlugin(Star):
         self.rate: float = self._to_float(cfg.get("usd_to_cny_rate", 7.2), 7.2)
         if self.rate <= 0:
             self.rate = 7.2
+        self.all_users_total_quota: float = self._to_float(
+            cfg.get("all_users_total_quota_usd", _ALL_USERS_TOTAL_DEFAULT),
+            _ALL_USERS_TOTAL_DEFAULT,
+        )
         self.admin_exempt: bool = bool(cfg.get("admin_exempt", True))
         # 思考强度
         self.think_enabled: bool = bool(cfg.get("think_enabled", True))
@@ -334,6 +353,13 @@ class ModelQuotaPlugin(Star):
             cfg.get(
                 "total_exceeded_tip",
                 "💰 你今天的消费总额度已用完（已花 {spent}/{limit}），明天再来吧～",
+            )
+        )
+        self.all_users_exhausted_tip: str = str(
+            cfg.get(
+                "all_users_exhausted_tip",
+                "🈵 今天本 bot 的全用户总额度已用完（已花 {spent}/{limit}），"
+                "明天再来吧～",
             )
         )
         self.global_exhausted_tip: str = str(
@@ -530,6 +556,21 @@ class ModelQuotaPlugin(Star):
             return f"峰时 {self.peak_multiplier:g}×"
         return "谷时 1×"
 
+    def _all_users_line(self, bot_total: float) -> str:
+        """文本版的「全用户总额」行（中等进度条）。"""
+        alimit = self.all_users_total_quota
+        if alimit > 0:
+            pct = min(bot_total / alimit * 100.0, 100.0)
+            line = (
+                f"👥 全用户总额 {self._bar(pct)} {pct:>3.0f}% "
+                f"已花 {self.cny(bot_total)}/{self.cny(alimit)}"
+                f" 剩 {self.cny(max(alimit - bot_total, 0))}"
+            )
+            if bot_total >= alimit - _EPS:
+                line += f"  {LIMITED_MARK} 已用完"
+            return line
+        return f"👥 全用户总额：已花 {self.cny(bot_total)}（不限）"
+
     def _peak_note_lines(self) -> list[str]:
         """文本输出里附一行峰谷状态（无峰谷模型时为空）。"""
         note = self._peak_summary_note()
@@ -608,7 +649,11 @@ class ModelQuotaPlugin(Star):
         if self.quota_preset == QUOTA_PRESET_OPENCODE_GO:
             monthly = self._preset_monthly_limit(provider_id, model)
             if monthly is not None:
-                return monthly / _QUOTA_POOL_DIVISOR
+                # 只有 $15 档保留每模型总池 $1；$30/$60 档的额度远大于
+                # 「全用户总额」，单设总池永远不会触发，交给全用户总额统一约束。
+                if monthly == _QUOTA_POOL_TIER_MONTHLY:
+                    return _QUOTA_POOL_TIER_AMOUNT
+                return _QUOTA_POOL_UNLIMITED
         return self.default_global_quota
 
     def cny(self, usd: float) -> str:
@@ -941,6 +986,15 @@ class ModelQuotaPlugin(Star):
                 users_hit += 1
         return users_hit, buckets_hit
 
+    def bot_total_spent(self, data: dict, bot: str) -> float:
+        """某个 bot 上所有用户、所有模型的合计花费（美元）。"""
+        total = 0.0
+        spent_map, _ = self._pool_totals(data, bot)
+        for v in spent_map.values():
+            if isinstance(v, (int, float)) and v > 0:
+                total += v
+        return round(total, 10)
+
     def _active_bots(self, data: dict) -> list[str]:
         """今日有记录的 bot 列表。"""
         bots: set[str] = set()
@@ -1013,6 +1067,17 @@ class ModelQuotaPlugin(Star):
                 await event.send(event.plain_result(tip))
                 event.stop_event()
                 return
+
+            alimit = self.all_users_total_quota
+            if alimit > 0:
+                btotal = self.bot_total_spent(data, bot)
+                if btotal + price > alimit + _EPS:
+                    tip = self.all_users_exhausted_tip.format(
+                        spent=self.cny(btotal), limit=self.cny(alimit)
+                    )
+                    await event.send(event.plain_result(tip))
+                    event.stop_event()
+                    return
 
             glimit = self.global_limit(pid, model_name)
             if glimit > 0 and gspent + price > glimit + _EPS:
@@ -1441,7 +1506,7 @@ class ModelQuotaPlugin(Star):
                     f"（所有模型合计）"
                 ),
                 sub_right=f"剩 {self.cny(max(tlimit - total, 0))}",
-                thick=True,
+                weight=2,
             )
         return QuotaRow(
             label="个人总额",
@@ -1449,7 +1514,7 @@ class ModelQuotaPlugin(Star):
             limited=False,
             sub_left=f"已花 {self.cny(total)}（总额不限）",
             sub_right="",
-            thick=True,
+            weight=2,
         )
 
     @staticmethod
@@ -1589,8 +1654,13 @@ class ModelQuotaPlugin(Star):
         width = CARD_WIDTH * scale
         pad = CARD_PAD * scale
         bar_h = 8 * scale
+        mid_h = 11 * scale
+        """全用户总额行的中等进度条高度。"""
         thick_h = 15 * scale
-        """个人总额行的加粗进度条高度。"""
+        """个人总额行的最粗进度条高度。"""
+
+        def row_bar_h(weight: int) -> int:
+            return thick_h if weight >= 2 else (mid_h if weight == 1 else bar_h)
         pool_h = 5 * scale
         gap_label_bar = 9 * scale
         gap_bar_sub = 8 * scale
@@ -1625,7 +1695,7 @@ class ModelQuotaPlugin(Star):
             height += 5 * scale + meta_h
         height += 20 * scale
         for _row in rows:
-            row_bar = thick_h if _row.thick else bar_h
+            row_bar = row_bar_h(_row.weight)
             height += label_h + gap_label_bar + row_bar
             if _row.pool_percent is not None:
                 height += gap_bar_pool + pool_h
@@ -1696,7 +1766,7 @@ class ModelQuotaPlugin(Star):
         for row in rows:
             label, percent, limited = row.label, row.percent, row.limited
             sub_left, sub_right, pool_pct = row.sub_left, row.sub_right, row.pool_percent
-            cur_bar_h = thick_h if row.thick else bar_h
+            cur_bar_h = row_bar_h(row.weight)
             color = self._fill_color(percent, limited)
             pct_text = f"{percent:.0f}%"
             pct_w = probe.textlength(pct_text, font=f_pct)
@@ -1782,13 +1852,16 @@ class ModelQuotaPlugin(Star):
         spent: dict,
         gspent_map: dict,
         total: float,
+        bot_total: float | None = None,
     ) -> str | None:
         """尝试渲染个人额度图片卡；配置为 text 或渲染失败时返回 None（调用方回退文本）。"""
         if self.quota_render == "text":
             return None
         model_rows = self._quota_card_rows_personal(counts, spent, gspent_map)
-        # 个人总额置顶（加粗条）；没有可用模型时也显示总额
+        # 置顶：个人总额（最粗）-> 全用户总额（中等）-> 各模型
         rows: list[QuotaRow] = [self._total_row(total)]
+        if bot_total is not None:
+            rows.append(self._all_users_row(bot_total))
         rows.extend(model_rows)
         try:
             name = event.get_sender_name() or ""
@@ -1806,6 +1879,31 @@ class ModelQuotaPlugin(Star):
         if card is None and self.quota_render == "image":
             logger.warning("model_quota: 图片渲染失败（缺 Pillow 或中文字体），已回退文本")
         return card
+
+    def _all_users_row(self, bot_total: float) -> QuotaRow:
+        """全用户总额行（本 bot 所有用户合计，中等粗细）。"""
+        alimit = self.all_users_total_quota
+        if alimit > 0:
+            pct = min(bot_total / alimit * 100.0, 100.0)
+            return QuotaRow(
+                label="全用户总额",
+                percent=pct,
+                limited=bot_total >= alimit - _EPS,
+                sub_left=(
+                    f"已花 {self.cny(bot_total)} / 上限 {self.cny(alimit)}"
+                    f"（本 bot 所有用户合计）"
+                ),
+                sub_right=f"剩 {self.cny(max(alimit - bot_total, 0))}",
+                weight=1,
+            )
+        return QuotaRow(
+            label="全用户总额",
+            percent=0.0,
+            limited=False,
+            sub_left=f"已花 {self.cny(bot_total)}（全用户总额不限）",
+            sub_right="",
+            weight=1,
+        )
 
     def _model_list_rows(
         self,
@@ -1869,11 +1967,14 @@ class ModelQuotaPlugin(Star):
         spent: dict,
         gspent_map: dict,
         total: float,
+        bot_total: float | None = None,
     ) -> str | None:
         """渲染可选模型图片卡；配置为 text 或缺 Pillow 时返回 None。"""
         if self.quota_render == "text":
             return None
         rows: list[QuotaRow] = [self._total_row(total)]
+        if bot_total is not None:
+            rows.append(self._all_users_row(bot_total))
         rows.extend(
             self._model_list_rows(items, current, counts, spent, gspent_map)
         )
@@ -1942,7 +2043,14 @@ class ModelQuotaPlugin(Star):
             gspent_map, gcount_map = self._pool_totals(data, bot)
             # 先尝试图片卡（与 /quota 同款渲染），失败回退文本
             card = await self._model_list_card(
-                event, items, current, counts, spent, gspent_map, total
+                event,
+                items,
+                current,
+                counts,
+                spent,
+                gspent_map,
+                total,
+                self.bot_total_spent(data, bot),
             )
             if card:
                 yield event.image_result(card)
@@ -1968,6 +2076,9 @@ class ModelQuotaPlugin(Star):
                 lines.append(f"📊 我今日剩余额度（1$≈{self.cny(1)}）：")
                 lines.extend(rem_lines)
                 lines.append(self._total_line(total))
+                lines.append(
+                    self._all_users_line(self.bot_total_spent(data, bot))
+                )
                 lines.append(self._reset_line())
                 lines.extend(self._peak_note_lines())
                 lines.append("")
@@ -2074,7 +2185,7 @@ class ModelQuotaPlugin(Star):
             counts, spent, total = self._personal_totals(data, ukey)
             gspent_map, gcount_map = self._pool_totals(data, bot)
             card = await self._personal_quota_card(
-                event, counts, spent, gspent_map, total
+                event, counts, spent, gspent_map, total, self.bot_total_spent(data, bot)
             )
             if card:
                 yield event.image_result(card)
@@ -2085,6 +2196,7 @@ class ModelQuotaPlugin(Star):
             )
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
             lines.append(self._total_line(total))
+            lines.append(self._all_users_line(self.bot_total_spent(data, bot)))
             lines.append(self._reset_line())
             lines.extend(self._peak_note_lines())
             yield event.plain_result("\n".join(lines))
@@ -2123,12 +2235,16 @@ class ModelQuotaPlugin(Star):
                         f"每人 {self._fmt_limit_usd(self.user_model_limit(pid, model), self.cny)}"
                     )
             lines.append(
-                f"总池按 bot 分开，每个 bot 每模型上限 "
-                f"{self._fmt_limit_usd(self.default_global_quota, self.cny)}；"
                 f"每人每日总额度 "
-                f"{self._fmt_limit_usd(self.default_user_total_quota, self.cny)}"
+                f"{self._fmt_limit_usd(self.default_user_total_quota, self.cny)}；"
+                f"全用户总额度（本 bot 所有用户合计）"
+                f"{self._fmt_limit_usd(self.all_users_total_quota, self.cny)}；"
+                f"总池按 bot 分开，每模型按档位（$15→$1/$30→$2/$60→$4）"
                 f"（1$≈{self.cny(1)}）"
             )
+            for bot in bots:
+                btotal = self.bot_total_spent(data, bot)
+                lines.append(f"【bot {bot}】全用户合计已花 {self.cny(btotal)}")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -2310,11 +2426,19 @@ class ModelQuotaPlugin(Star):
             "now": now,
             "limits": {
                 "user_total_usd": self.default_user_total_quota,
+                "all_users_total_usd": self.all_users_total_quota,
                 "user_model_default_usd": self.default_user_model_quota,
                 "pool_default_usd": self.default_global_quota,
             },
             "think_levels": list(self.think_levels),
             "think_admin_only": self.think_admin_only,
+            "bot_totals": {
+                b: {
+                    "spent_usd": self.bot_total_spent(data, b),
+                    "limit_usd": self.all_users_total_quota,
+                }
+                for b in self._active_bots(data)
+            },
             "peak_note": self._peak_summary_note(include_models=False),
             "opencode_only": bool(self.opencode_only_models and self._preset_active()),
             "conversations": conversations,

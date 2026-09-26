@@ -3,6 +3,7 @@ const bridge = window.AstrBotPluginPage;
 const els = {
   meta: document.getElementById("meta"),
   peak: document.getElementById("peak-note"),
+  totals: document.getElementById("totals"),
   error: document.getElementById("error"),
   list: document.getElementById("conversations"),
   catalog: document.getElementById("catalog-body"),
@@ -169,6 +170,16 @@ function render(data) {
     data.opencode_only ? "仅 OpenCode 模型" : "全部提供商",
   ].join(" · ");
   els.peak.textContent = data.peak_note || "";
+
+  const botTotals = data.bot_totals || {};
+  const limit = Number(data.limits.all_users_total_usd || 0);
+  const parts = Object.entries(botTotals).map(([bot, info]) => {
+    const spent = Number(info.spent_usd || 0);
+    return `bot ${bot} 已花 ${cny(spent)}${limit > 0 ? ` / ${cny(limit)}（剩 ${cny(Math.max(limit - spent, 0))}）` : "（不限）"}`;
+  });
+  els.totals.textContent = parts.length
+    ? `👥 全用户总额（本 bot 所有用户合计，每 bot 独立）：${parts.join("；")}`
+    : "";
 
   els.list.textContent = "";
   if (!data.conversations.length) {
