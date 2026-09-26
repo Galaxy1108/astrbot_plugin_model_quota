@@ -34,6 +34,11 @@ try:
 except Exception:  # pragma: no cover - 兼容导入
     AstrBotConfig = dict  # type: ignore[assignment,misc]
 
+try:
+    from astrbot.core.star.filter.command import GreedyStr
+except Exception:  # pragma: no cover - 极旧版本回退为普通字符串
+    GreedyStr = str  # type: ignore[assignment,misc]
+
 _USAGE_KEY = "daily_usage_v2"
 """KV 存储中用量数据的键名（v2：金额制）。"""
 
@@ -97,6 +102,12 @@ class ModelQuotaPlugin(Star):
             else []
         )
         self._warned_unknown_selectable = False
+        raw_names = cfg.get("model_display_names", {})
+        self.model_display_names: dict[str, str] = (
+            {str(k): str(v) for k, v in raw_names.items()}
+            if isinstance(raw_names, dict)
+            else {}
+        )
         self.default_price: float = self._to_float(
             cfg.get("default_call_price_usd", 0.0), 0.0
         )
@@ -328,6 +339,7 @@ class ModelQuotaPlugin(Star):
 
         pid = provider.meta().id
         price = self.price_for(pid)
+        disp = self._display_name(pid, provider.meta().model or "")
 
         if self.admin_exempt and event.is_admin():
             return  # 管理员免限额且不计数
@@ -347,7 +359,7 @@ class ModelQuotaPlugin(Star):
             ulimit = self.user_model_limit(pid)
             if ulimit > 0 and spent_m + price > ulimit + _EPS:
                 tip = self.quota_exceeded_tip.format(
-                    model=pid,
+                    model=disp,
                     used=used_n,
                     spent=self.cny(spent_m),
                     limit=self.cny(ulimit),
@@ -368,7 +380,7 @@ class ModelQuotaPlugin(Star):
             glimit = self.global_limit(pid)
             if glimit > 0 and gspent + price > glimit + _EPS:
                 tip = self.global_exhausted_tip.format(
-                    model=pid,
+                    model=disp,
                     used=data["global_counts"].get(pid, 0),
                     spent=self.cny(gspent),
                     limit=self.cny(glimit),
@@ -431,7 +443,11 @@ class ModelQuotaPlugin(Star):
             return None
 
     def _find_provider(self, token: str) -> tuple[int, str, str] | None:
-        """在开放自选的模型中按序号（1 起）或 provider_id 查找，返回 (序号, id, model)。"""
+        """在开放自选的模型中查找，返回 (序号, id, model)。
+
+        匹配顺序：序号（1 起）> 提供商 ID（忽略大小写）> 显示名（忽略大小写，
+        模型名带空格也能匹配，调用方需用 GreedyStr 接参）。
+        """
         items = self._provider_list(selectable_only=True)
         token = (token or "").strip()
         if token.isdigit():
@@ -443,6 +459,9 @@ class ModelQuotaPlugin(Star):
         lowered = token.lower()
         for i, (pid, model) in enumerate(items, start=1):
             if pid == token or pid.lower() == lowered:
+                return i, pid, model
+        for i, (pid, model) in enumerate(items, start=1):
+            if self._display_name(pid, model).lower() == lowered:
                 return i, pid, model
         return None
 
@@ -520,11 +539,16 @@ class ModelQuotaPlugin(Star):
     # 总池画在同一模型块内的第二条浅绿色进度条，花费与个人行写在同一行。
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _display_name(pid: str, model: str) -> str:
-        """卡片/文本用的正常模型名称：ID + 模型名。"""
+    def _display_name(self, pid: str, model: str) -> str:
+        """展示用真实模型名：显示名映射 > 模型自带名 > ID。
+
+        用户侧展示只用这个，不再出现提供商 ID。
+        """
+        alias = self.model_display_names.get(pid, "")
+        if alias:
+            return alias
         if model and model != pid:
-            return f"{pid} ({model})"
+            return model
         return pid
 
     def _quota_card_rows_personal(
@@ -905,8 +929,8 @@ class ModelQuotaPlugin(Star):
             "🤖 模型自选指令\n"
             "/model —— 查看可选模型、当前模型与剩余额度\n"
             "/model list —— 同上\n"
-            "/model use <序号|ID> —— 切换当前对话的模型（例：/model use 2）\n"
-            "  快捷写法：/model 2 或 /model <ID>\n"
+            "/model use <序号|名称> —— 切换当前对话的模型（例：/model use 2）\n"
+            "  快捷写法：/model 2 或 /model Kimi K3（名称带空格也能直接写）\n"
             "/model me —— 只看我今日的剩余额度\n"
             "说明：私聊谁都可以切换；群聊里只有管理员能切换。\n"
             "列表与切换只包含管理员开放的模型（selectable_models）。\n"
@@ -918,7 +942,7 @@ class ModelQuotaPlugin(Star):
         self,
         event: AstrMessageEvent,
         action: str | None = None,
-        target: str | None = None,
+        target: GreedyStr | None = None,
     ):
         """查看 / 切换当前对话使用的 AI 大模型。"""
         act = (action or "").strip().lower()
@@ -949,10 +973,9 @@ class ModelQuotaPlugin(Star):
             lines = ["🤖 可选 AI 模型（* 为当前对话正在用）："]
             for i, (pid, model) in enumerate(items, start=1):
                 mark = " *" if pid == current else ""
-                suffix = f"（{model}）" if model and model != pid else ""
                 price = self.price_for(pid)
                 fee = "免费" if price <= 0 else f"${price:.4f}/次"
-                lines.append(f"{i}. {pid}{suffix} [{fee}]{mark}")
+                lines.append(f"{i}. {self._display_name(pid, model)} [{fee}]{mark}")
             lines.append("")
             rem_lines = self._remaining_lines(
                 counts, spent, data.get("global", {}), data.get("global_counts", {})
@@ -996,13 +1019,14 @@ class ModelQuotaPlugin(Star):
             yield event.plain_result("\n".join(lines))
             return
 
-        # 切换：/model use <t> | /model <序号|ID>
+        # 切换：/model use <t> | /model <序号|ID|显示名>
+        # 显示名可能带空格（如 GPT 5.6 Luna），target 是 GreedyStr，
+        # 会拿到 action 之后的所有剩余文本，这里拼起来再匹配。
         token: str | None = None
         if act in ("use", "用", "切", "换", "qie", "huan"):
-            token = (target or "").strip()
-        elif act and target is None:
-            # /model 2 或 /model <id> 快捷写法
-            token = action.strip() if action else ""
+            token = str(target or "").strip()
+        elif act:
+            token = f"{action} {target or ''}".strip()
         if token:
             # 群聊仅管理员可切换
             if not event.is_private_chat() and not event.is_admin():
@@ -1013,10 +1037,11 @@ class ModelQuotaPlugin(Star):
             found = self._find_provider(token)
             if found is None:
                 yield event.plain_result(
-                    f"❌ 没找到模型「{token}」，用 /model 看看序号和 ID 是否写对了。"
+                    f"❌ 没找到模型「{token}」，用 /model 查序号后切换（如 /model use 2）。"
                 )
                 return
             idx, pid, model = found
+            disp = self._display_name(pid, model)
             try:
                 await self.context.provider_manager.set_provider(
                     provider_id=pid,
@@ -1025,9 +1050,8 @@ class ModelQuotaPlugin(Star):
                 )
             except Exception as e:
                 logger.warning(f"model_quota: 切换模型失败: {e}")
-                yield event.plain_result(f"❌ 切换到 {pid} 失败，请稍后再试或联系管理员。")
+                yield event.plain_result(f"❌ 切换到 {disp} 失败，请稍后再试或联系管理员。")
                 return
-            suffix = f"（{model}）" if model and model != pid else ""
             # 若目标模型额度已空，给出预警（仍允许切换）
             warn = ""
             price = self.price_for(pid)

@@ -5,6 +5,13 @@
     "type": "list",
     "default": []
   },
+  "model_display_names": {
+    "description": "模型显示名映射",
+    "hint": "key 为提供商 ID，value 为展示给用户的模型名，如 {"default": "Kimi K3", "vip": "GPT 5.6 Luna"}。列表、卡片、额度显示都用显示名；切换仍用序号或 ID。缺省用模型自带名称。",
+    "type": "dict",
+    "items": {},
+    "default": {}
+  },
   "default_call_price_usd": {
     "description": "模型单次调用默认单价（美元）",
     "hint": "对所有未单独配置单价的模型生效。0 表示免费，该模型不受金额限额约束。",
