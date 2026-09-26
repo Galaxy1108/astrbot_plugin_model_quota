@@ -61,6 +61,8 @@ COLOR_LABEL = (232, 232, 232)
 COLOR_MUTED = (148, 148, 148)
 COLOR_TRACK = (48, 48, 48)
 COLOR_GREEN = (63, 185, 80)
+COLOR_POOL = (134, 239, 172)
+"""总池进度条：浅绿色，与个人条区分。"""
 COLOR_AMBER = (210, 153, 34)
 COLOR_RED = (248, 81, 73)
 
@@ -449,19 +451,28 @@ class ModelQuotaPlugin(Star):
     ) -> list[str]:
         """个人剩余额度行：ocgo 风格（进度条 + 已用百分比 + 花费 + 重置由调用方统一附）。
 
-        只列开放自选的模型。
+        只列开放自选的模型，总池花费并在同一行。
         """
         lines: list[str] = []
         for pid, model in self._provider_list(selectable_only=True):
             price = self.price_for(pid)
-            show = model if model and model != pid else ""
-            title = f"{pid}" + (f"（{show}）" if show else "")
+            title = self._display_name(pid, model)
             used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
             spent_m = self._num(spent, pid)
             if price <= 0:
                 lines.append(f"- {title}：免费·{_UNLIMITED}（已用 {used_n} 次）")
                 continue
             ulimit = self.user_model_limit(pid)
+            pool_suffix = ""
+            glimit = self.global_limit(pid)
+            if glimit > 0:
+                gspent = self._num(gspent_map, pid)
+                pool_suffix = (
+                    f" · 总池已花 {self.cny(gspent)}/{self.cny(glimit)}"
+                    f"（剩 {self.cny(max(glimit - gspent, 0))}）"
+                )
+                if gspent + price > glimit + _EPS:
+                    pool_suffix += f" {LIMITED_MARK} 总池已用完"
             if ulimit > 0:
                 pct = min(spent_m / ulimit * 100.0, 100.0) if ulimit > 0 else 0.0
                 exhausted = spent_m + price > ulimit + _EPS
@@ -469,6 +480,7 @@ class ModelQuotaPlugin(Star):
                     f"- {title} {self._bar(pct)} {pct:>3.0f}% "
                     f"已花 {self.cny(spent_m)}/{self.cny(ulimit)}"
                     f"（{used_n} 次）剩 {self.cny(max(ulimit - spent_m, 0))}"
+                    f"{pool_suffix}"
                 )
                 if exhausted:
                     line += f"  {LIMITED_MARK} 已用完"
@@ -476,19 +488,8 @@ class ModelQuotaPlugin(Star):
             else:
                 lines.append(
                     f"- {title}：已用 {used_n} 次·{self.cny(spent_m)}（个人不限）"
+                    f"{pool_suffix}"
                 )
-            glimit = self.global_limit(pid)
-            if glimit > 0:
-                gspent = self._num(gspent_map, pid)
-                gpct = min(gspent / glimit * 100.0, 100.0) if glimit > 0 else 0.0
-                gline = (
-                    f"    总池 {self._bar(gpct)} {gpct:>3.0f}% "
-                    f"已花 {self.cny(gspent)}/{self.cny(glimit)}"
-                    f" 剩 {self.cny(max(glimit - gspent, 0))}"
-                )
-                if gspent + price > glimit + _EPS:
-                    gline += f"  {LIMITED_MARK} 已用完"
-                lines.append(gline)
         return lines
 
     def _total_line(self, total: float) -> str:
@@ -512,62 +513,79 @@ class ModelQuotaPlugin(Star):
         return total if isinstance(total, (int, float)) else 0.0
 
     # ------------------------------------------------------------------
-    # 额度图片卡（/ocgo 同款：深色卡片 + 进度条 + 百分比 + 重置时间）
-    # 行结构：(label, percent 已用百分比, limited 是否用完, sub_left, sub_right)
+    # 额度图片卡（深色卡片 + 进度条 + 百分比 + 重置时间）
+    # 行结构：(label, percent 个人已用百分比, limited 是否用完,
+    #          sub_left, sub_right, pool_percent 总池已用百分比或 None,
+    #          pool_sub 总池说明文字或 "")
+    # 总池画在同一模型块内的第二条浅绿色进度条，花费与个人行写在同一行。
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _display_name(pid: str, model: str) -> str:
+        """卡片/文本用的正常模型名称：ID + 模型名。"""
+        if model and model != pid:
+            return f"{pid} ({model})"
+        return pid
 
     def _quota_card_rows_personal(
         self, counts: dict, spent: dict, gspent_map: dict
-    ) -> list[tuple[str, float, bool, str, str]]:
+    ) -> list[tuple[str, float, bool, str, str, float | None, str]]:
         """组装个人额度卡片行，只含开放自选的模型 + 个人总额行。"""
-        rows: list[tuple[str, float, bool, str, str]] = []
+        rows: list[tuple[str, float, bool, str, str, float | None, str]] = []
         for pid, model in self._provider_list(selectable_only=True):
             price = self.price_for(pid)
+            label = self._display_name(pid, model)
             used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
             spent_m = self._num(spent, pid)
             if price <= 0:
                 rows.append(
-                    (pid, 0.0, False, f"免费·{_UNLIMITED}（已用 {used_n} 次）", model or "")
+                    (
+                        label,
+                        0.0,
+                        False,
+                        f"免费·{_UNLIMITED}（已用 {used_n} 次）",
+                        "",
+                        None,
+                        "",
+                    )
                 )
                 continue
             ulimit = self.user_model_limit(pid)
+            glimit = self.global_limit(pid)
+            pool_pct: float | None = None
+            pool_sub = ""
+            if glimit > 0:
+                gspent = self._num(gspent_map, pid)
+                pool_pct = min(gspent / glimit * 100.0, 100.0)
+                pool_sub = (
+                    f"总池已花 {self.cny(gspent)}/{self.cny(glimit)}"
+                    f"（剩 {self.cny(max(glimit - gspent, 0))}）"
+                )
             if ulimit > 0:
                 pct = min(spent_m / ulimit * 100.0, 100.0)
                 exhausted = spent_m + price > ulimit + _EPS
+                sub_left = (
+                    f"已花 {self.cny(spent_m)} / 上限 {self.cny(ulimit)}"
+                    f"（{used_n} 次）"
+                )
+                if pool_sub:
+                    sub_left += f" · {pool_sub}"
                 rows.append(
                     (
-                        pid,
+                        label,
                         pct,
                         exhausted,
-                        f"已花 {self.cny(spent_m)} / 上限 {self.cny(ulimit)}"
-                        f"（{used_n} 次）",
+                        sub_left,
                         f"剩 {self.cny(max(ulimit - spent_m, 0))}",
+                        pool_pct,
+                        "",
                     )
                 )
             else:
-                rows.append(
-                    (
-                        pid,
-                        0.0,
-                        False,
-                        f"已用 {used_n} 次·{self.cny(spent_m)}（个人不限）",
-                        model or "",
-                    )
-                )
-            glimit = self.global_limit(pid)
-            if glimit > 0:
-                gspent = self._num(gspent_map, pid)
-                gpct = min(gspent / glimit * 100.0, 100.0)
-                gexhausted = gspent + price > glimit + _EPS
-                rows.append(
-                    (
-                        f"总池·{pid}",
-                        gpct,
-                        gexhausted,
-                        f"已花 {self.cny(gspent)} / 上限 {self.cny(glimit)}",
-                        f"剩 {self.cny(max(glimit - gspent, 0))}",
-                    )
-                )
+                sub_left = f"已用 {used_n} 次·{self.cny(spent_m)}（个人不限）"
+                if pool_sub:
+                    sub_left += f" · {pool_sub}"
+                rows.append((label, 0.0, False, sub_left, "", pool_pct, ""))
         return rows
 
     @staticmethod
@@ -644,7 +662,7 @@ class ModelQuotaPlugin(Star):
         title: str,
         name: str,
         subtitle: str,
-        rows: list[tuple[str, float, bool, str, str]],
+        rows: list[tuple[str, float, bool, str, str, float | None, str]],
     ) -> str | None:
         """用 Pillow 绘制 /ocgo 同款额度卡片。返回图片路径，失败返回 None。
 
@@ -689,8 +707,10 @@ class ModelQuotaPlugin(Star):
         width = CARD_WIDTH * scale
         pad = CARD_PAD * scale
         bar_h = 8 * scale
+        pool_h = 5 * scale
         gap_label_bar = 9 * scale
         gap_bar_sub = 8 * scale
+        gap_bar_pool = 6 * scale
         gap_section = 20 * scale
 
         probe = ImageDraw.Draw(Image.new("RGB", (width, 8)))
@@ -706,8 +726,11 @@ class ModelQuotaPlugin(Star):
         subline_h = line_h("已花 ¥000.00 / 上限 ¥000.00", f_small)
 
         height = pad + title_h + 10 * scale + sub_h + 6 * scale + meta_h + 20 * scale
-        for _label, _percent, _limited, _left, _right in rows:
-            height += label_h + gap_label_bar + bar_h + gap_bar_sub + subline_h
+        for _label, _percent, _limited, _left, _right, _pool_pct, _pool in rows:
+            height += label_h + gap_label_bar + bar_h
+            if _pool_pct is not None:
+                height += gap_bar_pool + pool_h
+            height += gap_bar_sub + subline_h
             height += gap_section
         if rows:
             height -= gap_section
@@ -750,7 +773,7 @@ class ModelQuotaPlugin(Star):
         cursor += meta_h + 20 * scale
 
         track_w = width - pad * 2
-        for label, percent, limited, sub_left, sub_right in rows:
+        for label, percent, limited, sub_left, sub_right, pool_pct, _pool in rows:
             color = self._fill_color(percent, limited)
             pct_text = f"{percent:.0f}%"
             pct_w = probe.textlength(pct_text, font=f_pct)
@@ -784,7 +807,24 @@ class ModelQuotaPlugin(Star):
                     radius=bar_h // 2,
                     fill=color,
                 )
-            cursor += bar_h + gap_bar_sub
+            cursor += bar_h
+            # 总池条：同一模型块内的第二条浅绿色细进度条
+            if pool_pct is not None:
+                cursor += gap_bar_pool
+                draw.rounded_rectangle(
+                    (pad, cursor, pad + track_w, cursor + pool_h),
+                    radius=pool_h // 2,
+                    fill=COLOR_TRACK,
+                )
+                if pool_pct > 0:
+                    pool_fill = max(int(track_w * pool_pct / 100.0), pool_h)
+                    draw.rounded_rectangle(
+                        (pad, cursor, pad + pool_fill, cursor + pool_h),
+                        radius=pool_h // 2,
+                        fill=COLOR_POOL,
+                    )
+                cursor += pool_h
+            cursor += gap_bar_sub
 
             draw.text((pad, cursor), sub_left, font=f_small, fill=COLOR_MUTED)
             if sub_right:
@@ -837,11 +877,13 @@ class ModelQuotaPlugin(Star):
                     total >= tlimit - _EPS,
                     f"已花 {self.cny(total)} / 上限 {self.cny(tlimit)}",
                     f"剩 {self.cny(max(tlimit - total, 0))}",
+                    None,
+                    "",
                 )
             )
         else:
             rows.append(
-                ("个人总额", 0.0, False, f"已花 {self.cny(total)}（总额不限）", "")
+                ("个人总额", 0.0, False, f"已花 {self.cny(total)}（总额不限）", "", None, "")
             )
         try:
             name = event.get_sender_name() or ""
