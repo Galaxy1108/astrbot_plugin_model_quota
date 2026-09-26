@@ -5,9 +5,10 @@ desc: >-
   提供 /model 指令查看并切换当前对话使用的 AI 大模型（私聊谁都可切，
   群聊仅管理员可切换）；提供 /quota 指令查询当日剩余额度（额度图片卡）。
   管理员按美元配置单价与限额：可选用模型白名单、每人每天每模型限额、每人每天消费总额度、
-  按模型全用户每日总限额；内置 OpenCode Go 价目预设自动换算单次单价，支持峰谷定价，
+  按模型每 bot 每日总池（各 bot 独立、不合并）；内置 OpenCode Go 价目与限额预设
+  （单价自动换算、峰谷定价、每人每日额度按官方月额度 ÷60），每人每天另有消费总额度，
   管理员默认免限额且不计数。超限自动拦截并提示。
-version: 1.3.0
+version: 1.4.0
 author: Galaxy1108
 repo: https://github.com/Galaxy1108/astrbot_plugin_model_quota
 astrbot_version: ">=4.5.7"

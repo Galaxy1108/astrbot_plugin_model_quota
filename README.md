@@ -43,6 +43,28 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 把 `peak_timezone_offset` 设成 `8`、`peak_windows` 写成 `["09:00-12:00","14:00-18:00"]` 即可。
 自建模型要参与峰谷，写进 `peak_models`；也可用 `model_peak_prices_usd` 直接指定峰时单价。
 
+### 内置限额预设（`quota_preset: opencode_go`，默认开启）
+
+按官方每月额度 ÷ 60 自动得出**每人每天每模型**的额度：
+
+| 官方每月额度 | 每人每天额度 | 代表模型 |
+|---|---|---|
+| $60 | **$1.00** | GLM-5.2 / GLM-5.1 / 5.3-Flash、Kimi K2.6 / K2.7 Code、MiniMax M3 / M2.7、LongCat-2.0、Hy3、MiMo-V2.5、**DeepSeek V4.1 Flash**、Qwen3.7 / 3.6 Plus、Muse Spark |
+| $30 | **$0.50** | Qwen3.8 Flash、Qwen3.7 Max、DeepSeek V4 Flash、Hy4 preview |
+| $15 | **$0.25** | Kimi K3、Qwen3.8 Max、GLM-5.3、MiMo-V2.6-Pro / V2.5-Pro、DeepSeek V4 Pro / V4 Flash Vision Exp、GPT 5.6 / 6 Luna、Grok 4.6 / 4.7 |
+
+另外两条全局规则（与预设同时生效）：
+
+- **每 bot 每模型总池 $1/天**（`default_global_quota_usd`）：同一个 bot 上所有非管理员用户共享；
+- **每人每天消费总额 $2**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总。
+
+> ⚠️ **总池按 bot 分开**：一个 bot 一个独立总池，多个 bot 之间不合并。
+> 你有 7 个 bot，就是 7 个互不影响的池子，各自 $1/模型/天。
+> 个人限额则跨 bot 合并（换 bot 不会重置你的 $2 总额度），避免来回切 bot 刷额度。
+
+想手改就填 `model_user_quotas_usd` / `model_global_quotas_usd`（优先级高于预设），
+或者把 `quota_preset` 设为 `off` 完全自己填。
+
 ## 用户指令
 
 | 指令 | 说明 |
@@ -60,7 +82,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 ## `/quota` 显示什么样（额度图片卡）
 
-`/quota`（别名 `/额度`、`/限额`）默认发一张深色图片卡：
+`/quota`（别名 `/额度`、`/限额`）默认发一张深色图片卡（下例即预设额度下的效果）：
 
 ![剩余额度卡片示例](assets/quota_card.png)
 
@@ -75,27 +97,28 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 ```text
 📊 我今日剩余额度（1$≈¥7.20）：
-- Kimi K3 ██ 14% 已花 ¥0.50/¥3.60（35 次）剩 ¥3.10
-- GPT 5.6 Luna ██████ 30% 已花 ¥2.16/¥7.20（6 次）剩 ¥5.04 · 总池已花 ¥46.80/¥144.00（剩 ¥97.20）
-- Space Bunny Free：免费·不限（已用 12 次）
-💰 个人总额 ████ 18% 已花 ¥2.66/¥14.40 剩 ¥11.74
-⏰ 每日 00:00 重置（14 小时 45 分后重置，明天 00:00）
+- Kimi K3 ███ 37% 已花 ¥0.66/¥1.80（3 次）剩 ¥1.14 · 总池已花 ¥3.60/¥7.20（剩 ¥3.60）
+- GLM-5.2 ██ 28% 已花 ¥2.01/¥7.20（20 次）剩 ¥5.19 · 总池已花 ¥1.44/¥7.20（剩 ¥5.76）
+- DeepSeek V4.1 Flash ██ 18% 已花 ¥1.33/¥7.20（400 次）剩 ¥5.87 · 谷时（峰时 2×）
+💰 个人总额 ████ 40% 已花 ¥0.96/¥14.40 剩 ¥13.44
+⏰ 每日 00:00 重置（13 小时 35 分后重置，明天 00:00）
+🕐 当前谷时；峰时 2×（周一至五 01:00-04:00、06:00-10:00 UTC+0）
 ```
 
 即：逐模型显示**正常模型名 + 已用次数 + 已花人民币 + 剩余/上限**，
 有总池的模型总池花费并在同一行；
 最后再有一行**个人今日总花费与剩余额度**。免费模型显示"免费·不限"。
-文本版末尾会附 `⏰ 每日 00:00 重置（X 小时后重置，明天 00:00）`。
+文本版末尾会附重置时间与峰谷状态。
 
 ## 管理员指令（`/quota` 子命令，仅管理员）
 
 | 指令 | 说明 |
 |---|---|
-| `/quota all` | 今日全量：各模型单价、总池已花/上限、用过次数、每人上限、个人总额度 |
-| `/quota usage` | 今日各模型总花费/总池/次数/人数 |
+| `/quota all` | 今日全量：**按 bot 分列**各模型单价、总池已花/上限、次数、每人上限 |
+| `/quota usage` | 今日用量统计（按 bot 分组） |
 | `/quota usage <用户ID>` | 查某用户今日明细（次数/花费/总花，支持 sender_id 子串匹配） |
-| `/quota reset` | 清空今日全用户计数（个人 + 总池） |
-| `/quota reset <用户ID>` | 只重置某用户（总池自动重算） |
+| `/quota reset` | 清空今日全部记录（个人 + 所有 bot 的总池） |
+| `/quota reset <用户ID>` | 只重置某用户（各 bot 总池随之更新） |
 
 ## 插件配置（WebUI 可视化编辑，单位美元）
 
@@ -113,11 +136,12 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `peak_weekdays_only` | true | 周末全天低谷 |
 | `peak_models` | `[]` | 额外参与峰谷的模型（预设里的 DeepSeek 已自动包含） |
 | `model_peak_prices_usd` | `{}` | 直接指定峰时单价，优先于「低谷价×倍数」 |
-| `default_user_model_quota_usd` | 1.0 | 每人每天每模型默认限额 |
+| `quota_preset` | opencode_go | 内置限额预设：按官方月额度 ÷ 60 得出每人每日额度（$60→$1、$30→$0.5、$15→$0.25）；`off` 只用手填 |
+| `default_user_model_quota_usd` | 1.0 | 未命中预设且未单独配置时的每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
-| `default_user_total_quota_usd` | 2.0 | **每人每天全部模型消费总额度** |
-| `default_global_quota_usd` | 0 | 全用户总池默认，0=不限 |
-| `model_global_quotas_usd` | `{}` | 按模型覆盖总池，例 `{"vip": 100.0}` |
+| `default_user_total_quota_usd` | 2.0 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
+| `default_global_quota_usd` | 1.0 | **每个 bot 每模型的每日总池**（各 bot 独立，不合并）；0=不限 |
+| `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |
 | `quota_render` | auto | 个人额度展示：`auto`/`image`（图片卡）/`text` |
 | `admin_exempt` | true | 管理员免限额且不计数（不占总池） |

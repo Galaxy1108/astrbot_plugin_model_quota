@@ -39,7 +39,7 @@ try:
 except Exception:  # pragma: no cover - 极旧版本回退为普通字符串
     GreedyStr = str  # type: ignore[assignment,misc]
 
-_USAGE_KEY = "daily_usage_v2"
+_USAGE_KEY = "daily_usage_v3"
 """KV 存储中用量数据的键名（v2：金额制）。"""
 
 _UNLIMITED = "不限"
@@ -120,6 +120,15 @@ _OPENCODE_GO_MONTHLY_LIMITS: dict[str, float] = {
 PRICING_PRESET_OPENCODE_GO = "opencode_go"
 """内置单价预设名。"""
 
+QUOTA_PRESET_OPENCODE_GO = "opencode_go"
+"""内置限额预设名：按官方每月额度 ÷ 60 换算成每人每日额度。"""
+
+_QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
+"""限额预设下所有模型的全用户每日总池（美元）。"""
+
+_QUOTA_PRESET_DEFAULT_TOTAL = 2.0
+"""限额预设下每人每天消费总额度（美元）。"""
+
 # 进度条字形：与 opencode 用量插件（/ocgo）同款，GBK 安全。
 BAR_WIDTH = 10
 BAR_FILLED = "█"
@@ -191,6 +200,9 @@ class ModelQuotaPlugin(Star):
             .strip()
             .lower()
         )
+        self.quota_preset: str = (
+            str(cfg.get("quota_preset", QUOTA_PRESET_OPENCODE_GO) or "").strip().lower()
+        )
         # 峰谷定价
         self.peak_enabled: bool = bool(cfg.get("peak_pricing_enabled", True))
         self.peak_multiplier: float = self._to_float(
@@ -223,7 +235,8 @@ class ModelQuotaPlugin(Star):
             cfg.get("default_user_total_quota_usd", 2.0), 2.0
         )
         self.default_global_quota: float = self._to_float(
-            cfg.get("default_global_quota_usd", 0.0), 0.0
+            cfg.get("default_global_quota_usd", _QUOTA_PRESET_DEFAULT_GLOBAL),
+            _QUOTA_PRESET_DEFAULT_GLOBAL,
         )
         self.model_global_quotas: dict[str, float] = self._to_float_map(
             cfg.get("model_global_quotas_usd", {})
@@ -466,9 +479,27 @@ class ModelQuotaPlugin(Star):
             return f" · 峰时 {self.peak_multiplier:g}×（当前）"
         return f" · 谷时（峰时 {self.peak_multiplier:g}×）"
 
-    def user_model_limit(self, provider_id: str) -> float:
-        """某模型每人每日限额（美元，<=0 不限）。"""
-        return self.model_user_quotas.get(provider_id, self.default_user_model_quota)
+    def user_model_limit(self, provider_id: str, model: str = "") -> float:
+        """某模型每人每日限额（美元，<=0 不限）。
+
+        优先级：model_user_quotas_usd 显式配置 > 内置限额预设（按官方月额度 ÷ 60）
+        > default_user_model_quota_usd。
+        """
+        if provider_id in self.model_user_quotas:
+            return self.model_user_quotas[provider_id]
+        if self.quota_preset == QUOTA_PRESET_OPENCODE_GO:
+            monthly = self._preset_monthly_limit(provider_id, model)
+            if monthly is not None:
+                # 官方月额度 ÷ 60 得到每人每日额度：$60 -> $1，$30 -> $0.5，$15 -> $0.25
+                return monthly / 60.0
+        return self.default_user_model_quota
+
+    def _preset_monthly_limit(self, provider_id: str, model: str) -> float | None:
+        """取该模型在 OpenCode Go 的每月额度（美元），未知返回 None。"""
+        key = self._preset_key(provider_id, model)
+        if key is None:
+            return None
+        return _OPENCODE_GO_MONTHLY_LIMITS.get(key)
 
     def global_limit(self, provider_id: str) -> float:
         """某模型全用户每日总限额（美元，<=0 不限）。"""
@@ -516,9 +547,23 @@ class ModelQuotaPlugin(Star):
         return f"⏰ 每日 00:00 重置（{rel}，明天 00:00）"
 
     # ------------------------------------------------------------------
-    # 用量存储：
-    # {date, users: {ukey: {name, counts: {pid: n}, spent: {pid: usd}, total: usd}},
-    #  global: {pid: usd}, global_counts: {pid: n}}
+    # 用量存储
+    #
+    # 记录按「用户 -> bot -> 用量」嵌套，总池按 bot 聚合：
+    # {
+    #   "date": "YYYY-MM-DD",
+    #   "records": {
+    #       "<平台:用户ID>": {
+    #           "<bot 自身ID>": {
+    #               "name": "昵称",
+    #               "counts": {provider_id: 次数},
+    #               "spent":  {provider_id: 美元},
+    #           }
+    #       }
+    #   }
+    # }
+    # 个人限额跨 bot 汇总（同一人换 bot 也共用「每人每天」额度）；
+    # 总池只统计当前 bot 自己的用量，各 bot 互不影响。
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -527,8 +572,17 @@ class ModelQuotaPlugin(Star):
 
     @staticmethod
     def _user_key(event: AstrMessageEvent) -> str:
-        """按人标识：平台名 + 发送者 ID（群私聊通用）。"""
+        """按人标识：平台名 + 发送者 ID（群私聊通用，不含 bot）。"""
         return f"{event.get_platform_name()}:{event.get_sender_id()}"
+
+    @staticmethod
+    def _bot_id(event: AstrMessageEvent) -> str:
+        """当前 bot 自身 ID（每个 bot 一个独立总池）。"""
+        try:
+            self_id = str(event.get_self_id() or "").strip()
+        except Exception:
+            self_id = ""
+        return self_id or "bot"
 
     @staticmethod
     def _num(mapping: dict, key: str) -> float:
@@ -541,58 +595,111 @@ class ModelQuotaPlugin(Star):
         if (
             not isinstance(data, dict)
             or data.get("date") != today
-            or not isinstance(data.get("users"), dict)
-            or not isinstance(data.get("global"), dict)
+            or not isinstance(data.get("records"), dict)
         ):
             # 跨天、版本升级或数据异常：整体清零（天然按天重置，无需定时任务）
-            data = {"date": today, "users": {}, "global": {}, "global_counts": {}}
+            data = {"date": today, "records": {}}
             await self.put_kv_data(_USAGE_KEY, data)
-        if not isinstance(data.get("global_counts"), dict):
-            data["global_counts"] = {}
         return data
 
     async def _save_usage(self, data: dict) -> None:
         await self.put_kv_data(_USAGE_KEY, data)
 
-    def _user_info(self, data: dict, ukey: str, event: AstrMessageEvent) -> dict:
-        info = data["users"].get(ukey)
-        if not isinstance(info, dict):
-            info = {"name": "", "counts": {}, "spent": {}, "total": 0.0}
-            data["users"][ukey] = info
+    def _bot_bucket(
+        self, data: dict, ukey: str, bot: str, event: AstrMessageEvent | None = None
+    ) -> dict:
+        """取出（必要时创建）某用户在某 bot 下的用量桶。"""
+        records = data["records"]
+        per_user = records.get(ukey)
+        if not isinstance(per_user, dict):
+            per_user = {}
+            records[ukey] = per_user
+        bucket = per_user.get(bot)
+        if not isinstance(bucket, dict):
+            bucket = {"name": "", "counts": {}, "spent": {}}
+            per_user[bot] = bucket
         for k in ("counts", "spent"):
-            if not isinstance(info.get(k), dict):
-                info[k] = {}
-        if not isinstance(info.get("total"), (int, float)):
-            info["total"] = 0.0
-        try:
-            name = event.get_sender_name()
-            if name:
-                info["name"] = name
-        except Exception:
-            pass
-        return info
+            if not isinstance(bucket.get(k), dict):
+                bucket[k] = {}
+        if event is not None:
+            try:
+                name = event.get_sender_name()
+                if name:
+                    bucket["name"] = name
+            except Exception:
+                pass
+        return bucket
 
-    def _recount_global(self, data: dict) -> None:
-        """用各用户数据重算全局（删除用户后保持一致）。"""
-        total: dict[str, float] = {}
+    def _display_name_of(self, data: dict, ukey: str) -> str:
+        """从记录里取该用户的昵称（任一 bot 下有值即可）。"""
+        per_user = data.get("records", {}).get(ukey, {})
+        if isinstance(per_user, dict):
+            for bucket in per_user.values():
+                if isinstance(bucket, dict) and bucket.get("name"):
+                    return str(bucket["name"])
+        return ""
+
+    def _personal_totals(self, data: dict, ukey: str) -> tuple[dict, dict, float]:
+        """某人今日跨 bot 汇总：(次数表, 花费表, 总花费)。"""
         counts: dict[str, int] = {}
-        users = data.get("users", {})
-        if isinstance(users, dict):
-            for info in users.values():
-                if not isinstance(info, dict):
+        spent: dict[str, float] = {}
+        total = 0.0
+        per_user = data.get("records", {}).get(ukey, {})
+        if isinstance(per_user, dict):
+            for bucket in per_user.values():
+                if not isinstance(bucket, dict):
                     continue
-                spent = info.get("spent", {})
-                if isinstance(spent, dict):
-                    for pid, v in spent.items():
-                        if isinstance(v, (int, float)) and v > 0:
-                            total[pid] = round(total.get(pid, 0.0) + v, 10)
-                cnt = info.get("counts", {})
-                if isinstance(cnt, dict):
-                    for pid, n in cnt.items():
+                bcounts = bucket.get("counts", {})
+                if isinstance(bcounts, dict):
+                    for pid, n in bcounts.items():
                         if isinstance(n, int) and n > 0:
                             counts[pid] = counts.get(pid, 0) + n
-        data["global"] = total
-        data["global_counts"] = counts
+                bspent = bucket.get("spent", {})
+                if isinstance(bspent, dict):
+                    for pid, v in bspent.items():
+                        if isinstance(v, (int, float)) and v > 0:
+                            spent[pid] = round(spent.get(pid, 0.0) + v, 10)
+                            total += v
+        return counts, spent, round(total, 10)
+
+    def _pool_totals(self, data: dict, bot: str) -> tuple[dict, dict]:
+        """某个 bot 自己的总池：(该 bot 各模型花费表, 各模型次数表)。"""
+        spent: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        records = data.get("records", {})
+        if isinstance(records, dict):
+            for per_user in records.values():
+                if not isinstance(per_user, dict):
+                    continue
+                bucket = per_user.get(bot)
+                if not isinstance(bucket, dict):
+                    continue
+                bspent = bucket.get("spent", {})
+                if isinstance(bspent, dict):
+                    for pid, v in bspent.items():
+                        if isinstance(v, (int, float)) and v > 0:
+                            spent[pid] = round(spent.get(pid, 0.0) + v, 10)
+                bcounts = bucket.get("counts", {})
+                if isinstance(bcounts, dict):
+                    for pid, n in bcounts.items():
+                        if isinstance(n, int) and n > 0:
+                            counts[pid] = counts.get(pid, 0) + n
+        return spent, counts
+
+    def _pool_of(self, data: dict, bot: str, pid: str) -> tuple[float, int]:
+        """某个 bot 在某模型上的 (花费, 次数)。"""
+        spent_map, count_map = self._pool_totals(data, bot)
+        return self._num(spent_map, pid), int(count_map.get(pid, 0) or 0)
+
+    def _active_bots(self, data: dict) -> list[str]:
+        """今日有记录的 bot 列表。"""
+        bots: set[str] = set()
+        records = data.get("records", {})
+        if isinstance(records, dict):
+            for per_user in records.values():
+                if isinstance(per_user, dict):
+                    bots.update(str(b) for b in per_user)
+        return sorted(bots)
 
     # ------------------------------------------------------------------
     # 限额拦截：每次唤起 AI 前触发
@@ -623,17 +730,15 @@ class ModelQuotaPlugin(Star):
 
         data = await self._load_usage()
         ukey = self._user_key(event)
-        info = self._user_info(data, ukey, event)
-        counts: dict = info["counts"]
-        spent: dict = info["spent"]
-        total = info["total"] if isinstance(info["total"], (int, float)) else 0.0
+        bot = self._bot_id(event)
+        counts, spent, total = self._personal_totals(data, ukey)
+        gspent, gcount = self._pool_of(data, bot, pid)
 
         used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
         spent_m = self._num(spent, pid)
-        gspent = self._num(data["global"], pid)
 
         if price > 0:
-            ulimit = self.user_model_limit(pid)
+            ulimit = self.user_model_limit(pid, model_name)
             if ulimit > 0 and spent_m + price > ulimit + _EPS:
                 tip = self.quota_exceeded_tip.format(
                     model=disp,
@@ -658,7 +763,7 @@ class ModelQuotaPlugin(Star):
             if glimit > 0 and gspent + price > glimit + _EPS:
                 tip = self.global_exhausted_tip.format(
                     model=disp,
-                    used=data["global_counts"].get(pid, 0),
+                    used=gcount,
                     spent=self.cny(gspent),
                     limit=self.cny(glimit),
                 )
@@ -666,17 +771,13 @@ class ModelQuotaPlugin(Star):
                 event.stop_event()
                 return
 
-        # 扣费放行（免费模型只计次数）
-        counts[pid] = used_n + 1
-        data["global_counts"][pid] = (
-            data["global_counts"].get(pid, 0) + 1
-            if isinstance(data["global_counts"].get(pid), int)
-            else 1
-        )
+        # 扣费放行（免费模型只计次数）；写入该用户在该 bot 下的桶
+        bucket = self._bot_bucket(data, ukey, bot, event)
+        bcounts: dict = bucket["counts"]
+        bspent: dict = bucket["spent"]
+        bcounts[pid] = (bcounts.get(pid, 0) if isinstance(bcounts.get(pid), int) else 0) + 1
         if price > 0:
-            spent[pid] = round(spent_m + price, 10)
-            info["total"] = round(total + price, 10)
-            data["global"][pid] = round(gspent + price, 10)
+            bspent[pid] = round(self._num(bspent, pid) + price, 10)
         await self._save_usage(data)
 
     # ------------------------------------------------------------------
@@ -758,7 +859,7 @@ class ModelQuotaPlugin(Star):
             if price <= 0:
                 lines.append(f"- {title}：免费·{_UNLIMITED}（已用 {used_n} 次）")
                 continue
-            ulimit = self.user_model_limit(pid)
+            ulimit = self.user_model_limit(pid, model)
             pool_suffix = ""
             glimit = self.global_limit(pid)
             if glimit > 0:
@@ -802,11 +903,6 @@ class ModelQuotaPlugin(Star):
                 line += f"  {LIMITED_MARK} 已用完"
             return line
         return f"💰 个人总额：已花 {self.cny(total)}（总额不限）"
-
-    @staticmethod
-    def _user_total(uinfo: dict) -> float:
-        total = uinfo.get("total", 0.0) if isinstance(uinfo, dict) else 0.0
-        return total if isinstance(total, (int, float)) else 0.0
 
     # ------------------------------------------------------------------
     # 额度图片卡（深色卡片 + 进度条 + 百分比 + 重置时间）
@@ -852,7 +948,7 @@ class ModelQuotaPlugin(Star):
                     )
                 )
                 continue
-            ulimit = self.user_model_limit(pid)
+            ulimit = self.user_model_limit(pid, model)
             glimit = self.global_limit(pid)
             pool_pct: float | None = None
             pool_sub = ""
@@ -1286,13 +1382,9 @@ class ModelQuotaPlugin(Star):
             current = await self._current_provider_id(event)
             data = await self._load_usage()
             ukey = self._user_key(event)
-            uinfo = data["users"].get(ukey, {})
-            counts = uinfo.get("counts", {}) if isinstance(uinfo, dict) else {}
-            spent = uinfo.get("spent", {}) if isinstance(uinfo, dict) else {}
-            if not isinstance(counts, dict):
-                counts = {}
-            if not isinstance(spent, dict):
-                spent = {}
+            bot = self._bot_id(event)
+            counts, spent, total = self._personal_totals(data, ukey)
+            gspent_map, gcount_map = self._pool_totals(data, bot)
             lines = ["🤖 可选 AI 模型（* 为当前对话正在用）："]
             for i, (pid, model) in enumerate(items, start=1):
                 mark = " *" if pid == current else ""
@@ -1309,13 +1401,11 @@ class ModelQuotaPlugin(Star):
                             fee += f"，谷时；峰时 ${base * self.peak_multiplier:.4f}"
                 lines.append(f"{i}. {self._display_name(pid, model)} [{fee}]{mark}")
             lines.append("")
-            rem_lines = self._remaining_lines(
-                counts, spent, data.get("global", {}), data.get("global_counts", {})
-            )
+            rem_lines = self._remaining_lines(counts, spent, gspent_map, gcount_map)
             if rem_lines:
                 lines.append(f"📊 我今日剩余额度（1$≈{self.cny(1)}）：")
                 lines.extend(rem_lines)
-                lines.append(self._total_line(self._user_total(uinfo if isinstance(uinfo, dict) else {})))
+                lines.append(self._total_line(total))
                 lines.append(self._reset_line())
                 lines.extend(self._peak_note_lines())
                 lines.append("")
@@ -1328,23 +1418,18 @@ class ModelQuotaPlugin(Star):
         if act in ("me", "my", "mine", "我的", "额度"):
             data = await self._load_usage()
             ukey = self._user_key(event)
-            uinfo = data["users"].get(ukey, {})
-            counts = uinfo.get("counts", {}) if isinstance(uinfo, dict) else {}
-            spent = uinfo.get("spent", {}) if isinstance(uinfo, dict) else {}
-            if not isinstance(counts, dict):
-                counts = {}
-            if not isinstance(spent, dict):
-                spent = {}
-            total = self._user_total(uinfo if isinstance(uinfo, dict) else {})
+            bot = self._bot_id(event)
+            counts, spent, total = self._personal_totals(data, ukey)
+            gspent_map, gcount_map = self._pool_totals(data, bot)
             card = await self._personal_quota_card(
-                event, counts, spent, data.get("global", {}), total
+                event, counts, spent, gspent_map, total
             )
             if card:
                 yield event.image_result(card)
                 return
             lines = [f"📊 我今日剩余额度（1$≈{self.cny(1)}）："]
             rem_lines = self._remaining_lines(
-                counts, spent, data.get("global", {}), data.get("global_counts", {})
+                counts, spent, gspent_map, gcount_map
             )
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
             lines.append(self._total_line(total))
@@ -1392,18 +1477,11 @@ class ModelQuotaPlugin(Star):
             if price > 0 and not (self.admin_exempt and event.is_admin()):
                 data = await self._load_usage()
                 ukey = self._user_key(event)
-                uinfo = data["users"].get(ukey, {})
-                spent = uinfo.get("spent", {}) if isinstance(uinfo, dict) else {}
-                total = uinfo.get("total", 0.0) if isinstance(uinfo, dict) else 0.0
-                total = total if isinstance(total, (int, float)) else 0.0
-                spent_m = self._num(spent if isinstance(spent, dict) else {}, pid)
-                gspent = self._num(
-                    data.get("global", {})
-                    if isinstance(data.get("global"), dict)
-                    else {},
-                    pid,
-                )
-                ulimit = self.user_model_limit(pid)
+                bot = self._bot_id(event)
+                _, spent, total = self._personal_totals(data, ukey)
+                spent_m = self._num(spent, pid)
+                gspent, _ = self._pool_of(data, bot, pid)
+                ulimit = self.user_model_limit(pid, model)
                 tlimit = self.default_user_total_quota
                 glimit = self.global_limit(pid)
                 if ulimit > 0 and spent_m + price > ulimit + _EPS:
@@ -1447,24 +1525,18 @@ class ModelQuotaPlugin(Star):
         if s in ("", "me", "my", "我的"):
             data = await self._load_usage()
             ukey = self._user_key(event)
-            uinfo = data["users"].get(ukey, {})
-            counts = uinfo.get("counts", {}) if isinstance(uinfo, dict) else {}
-            spent = uinfo.get("spent", {}) if isinstance(uinfo, dict) else {}
-            if not isinstance(counts, dict):
-                counts = {}
-            if not isinstance(spent, dict):
-                spent = {}
-            total = self._user_total(uinfo if isinstance(uinfo, dict) else {})
-            # 图片卡（/ocgo 同款）：成功则只发图，失败回退文本
+            bot = self._bot_id(event)
+            counts, spent, total = self._personal_totals(data, ukey)
+            gspent_map, gcount_map = self._pool_totals(data, bot)
             card = await self._personal_quota_card(
-                event, counts, spent, data.get("global", {}), total
+                event, counts, spent, gspent_map, total
             )
             if card:
                 yield event.image_result(card)
                 return
             lines = [f"📊 我今日剩余额度（1$≈{self.cny(1)}）："]
             rem_lines = self._remaining_lines(
-                counts, spent, data.get("global", {}), data.get("global_counts", {})
+                counts, spent, gspent_map, gcount_map
             )
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
             lines.append(self._total_line(total))
@@ -1479,32 +1551,39 @@ class ModelQuotaPlugin(Star):
             return
 
         data = await self._load_usage()
-        users = data["users"] if isinstance(data.get("users"), dict) else {}
-        gspent_map = data["global"] if isinstance(data.get("global"), dict) else {}
-        gcount_map = (
-            data["global_counts"] if isinstance(data.get("global_counts"), dict) else {}
-        )
+        records = data.get("records") if isinstance(data.get("records"), dict) else {}
+        all_users = list(records.keys())
+        items = self._provider_list()
+        model_of = {pid: model for pid, model in items}
 
         if s == "all":
-            lines = [f"📊 今日全量用量（{data.get('date', '')}，共 {len(users)} 人用过）："]
-            items = self._provider_list()
-            known = {pid for pid, _ in items}
-            for pid in list(known) + [k for k in gspent_map if k not in known]:
-                model = next((m for i, m in items if i == pid), "")
-                suffix = f"（{model}）" if model and model != pid else ""
-                gspent = self._num(gspent_map, pid)
-                gused_n = gcount_map.get(pid, 0)
-                lines.append(
-                    f"- {pid}{suffix}：单价 ${self.price_for(pid, model):.4f}/次，"
-                    f"总池已花 {self.cny(gspent)}/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
-                    f"（{gused_n} 次），每人 {self._fmt_limit_usd(self.user_model_limit(pid), self.cny)}"
-                )
+            bots = self._active_bots(data)
+            lines = [
+                f"📊 今日全量用量（{data.get('date', '')}，共 {len(all_users)} 人用过，"
+                f"{len(bots)} 个 bot 有记录）："
+            ]
+            if not bots:
+                lines.append("今日暂无用量。")
+            for bot in bots:
+                gspent_map, gcount_map = self._pool_totals(data, bot)
+                lines.append(f"【bot {bot}】本 bot 独立总池")
+                for pid in gspent_map:
+                    model = model_of.get(pid, "")
+                    lines.append(
+                        f"- {self._display_name(pid, model)}："
+                        f"单价 ${self.price_for(pid, model):.4f}/次，"
+                        f"总池已花 {self.cny(self._num(gspent_map, pid))}"
+                        f"/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
+                        f"（{gcount_map.get(pid, 0)} 次），"
+                        f"每人 {self._fmt_limit_usd(self.user_model_limit(pid, model), self.cny)}"
+                    )
             lines.append(
-                f"每人每日总额度：{self._fmt_limit_usd(self.default_user_total_quota, self.cny)}"
+                f"总池按 bot 分开，每个 bot 每模型上限 "
+                f"{self._fmt_limit_usd(self.default_global_quota, self.cny)}；"
+                f"每人每日总额度 "
+                f"{self._fmt_limit_usd(self.default_user_total_quota, self.cny)}"
                 f"（1$≈{self.cny(1)}）"
             )
-            if not items and not gspent_map:
-                lines.append("暂无可用模型，也暂无用量。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1512,23 +1591,21 @@ class ModelQuotaPlugin(Star):
             if arg:
                 key = arg.strip()
                 matched = [
-                    (uk, info)
-                    for uk, info in users.items()
-                    if isinstance(info, dict) and (key in uk or uk.endswith(f":{key}"))
+                    uk
+                    for uk in all_users
+                    if key in uk or uk.endswith(f":{key}")
                 ]
                 if not matched:
                     yield event.plain_result(f"今日没有找到用户「{key}」的用量记录。")
                     return
                 lines = [f"📊 用户用量（今日，共 {len(matched)} 条匹配）："]
-                for uk, info in matched[:20]:
-                    counts = info.get("counts", {}) if isinstance(info, dict) else {}
-                    spent = info.get("spent", {}) if isinstance(info, dict) else {}
-                    name = info.get("name", "") if isinstance(info, dict) else ""
-                    total = info.get("total", 0.0) if isinstance(info, dict) else 0.0
-                    total = total if isinstance(total, (int, float)) else 0.0
+                for uk in matched[:20]:
+                    counts, spent, total = self._personal_totals(data, uk)
+                    name = self._display_name_of(data, uk)
                     detail = ", ".join(
-                        f"{pid}:{n}次·{self.cny(self._num(spent if isinstance(spent, dict) else {}, pid))}"
-                        for pid, n in (counts.items() if isinstance(counts, dict) else [])
+                        f"{self._display_name(pid, model_of.get(pid, ''))}:{n}次"
+                        f"·{self.cny(self._num(spent, pid))}"
+                        for pid, n in counts.items()
                     )
                     lines.append(
                         f"- {name}（{uk}）：{detail or '无'}，总花 {self.cny(total)}"
@@ -1537,25 +1614,35 @@ class ModelQuotaPlugin(Star):
                     lines.append(f"…还有 {len(matched) - 20} 条未显示，请缩小查询范围。")
                 yield event.plain_result("\n".join(lines))
                 return
+            bots = self._active_bots(data)
             lines = [f"📊 今日用量统计（{data.get('date', '')}）："]
-            for pid, gspent in gspent_map.items():
-                users_used = sum(
-                    1
-                    for info in users.values()
-                    if isinstance(info, dict)
-                    and isinstance(info.get("spent"), dict)
-                    and self._num(info["spent"], pid) > 0
-                )
-                gused_n = gcount_map.get(pid, 0)
-                lines.append(
-                    f"- {pid}：总花 {self.cny(gspent if isinstance(gspent, (int, float)) else 0)}"
-                    f"/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
-                    f"（{gused_n} 次，{users_used} 人用过）"
-                )
-            if not gspent_map and not gcount_map:
+            if not bots:
                 lines.append("今日暂无用量。")
-            else:
-                lines.append(f"共 {len(users)} 人产生过记录。")
+            for bot in bots:
+                gspent_map, gcount_map = self._pool_totals(data, bot)
+                users_on_bot = sum(
+                    1
+                    for per_user in records.values()
+                    if isinstance(per_user, dict) and bot in per_user
+                )
+                lines.append(f"【bot {bot}】{users_on_bot} 人用过")
+                for pid, gspent in gspent_map.items():
+                    model = model_of.get(pid, "")
+                    users_used = sum(
+                        1
+                        for per_user in records.values()
+                        if isinstance(per_user, dict)
+                        and isinstance(per_user.get(bot), dict)
+                        and self._num(per_user[bot].get("spent", {}), pid) > 0
+                    )
+                    lines.append(
+                        f"- {self._display_name(pid, model)}："
+                        f"总花 {self.cny(gspent if isinstance(gspent, (int, float)) else 0)}"
+                        f"/{self._fmt_limit_usd(self.global_limit(pid), self.cny)}"
+                        f"（{gcount_map.get(pid, 0)} 次，{users_used} 人用过）"
+                    )
+            if bots:
+                lines.append(f"共 {len(all_users)} 人产生过记录。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -1564,23 +1651,19 @@ class ModelQuotaPlugin(Star):
                 key = arg.strip()
                 matched = [
                     uk
-                    for uk, info in users.items()
+                    for uk in all_users
                     if key in uk or uk.endswith(f":{key}")
                 ]
                 if not matched:
                     yield event.plain_result(f"今日没有找到用户「{key}」的用量记录，无需重置。")
                     return
                 for uk in matched:
-                    users.pop(uk, None)
-                self._recount_global(data)
+                    records.pop(uk, None)
                 await self._save_usage(data)
-                yield event.plain_result(f"✅ 已重置 {len(matched)} 条用户今日计数并重算总池。")
+                yield event.plain_result(f"✅ 已重置 {len(matched)} 条用户记录（总池随之更新）。")
                 return
-            await self.put_kv_data(
-                _USAGE_KEY,
-                {"date": self._today(), "users": {}, "global": {}, "global_counts": {}},
-            )
-            yield event.plain_result("✅ 已清空今日全用户计数（个人 + 总池）。")
+            await self.put_kv_data(_USAGE_KEY, {"date": self._today(), "records": {}})
+            yield event.plain_result("✅ 已清空今日全部记录（个人 + 所有 bot 的总池）。")
             return
 
         yield event.plain_result(self._quota_help())

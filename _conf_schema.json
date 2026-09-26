@@ -75,34 +75,41 @@
     "items": {},
     "default": {}
   },
+  "quota_preset": {
+    "description": "内置限额预设",
+    "hint": "opencode_go：按 OpenCode Go 官方每月额度 ÷ 60 自动得出每人每日额度（月额度 $60 → 每人每天 $1，$30 → $0.5，$15 → $0.25）；off：只用下面手填的限额。显式填写的限额优先级更高。",
+    "type": "string",
+    "options": ["opencode_go", "off"],
+    "default": "opencode_go"
+  },
   "default_user_model_quota_usd": {
     "description": "每人每天每个模型的默认限额（美元）",
-    "hint": "对所有未单独配置的模型生效。0 或负数表示不限。",
+    "hint": "未命中内置预设、也没单独配置的模型用它。0 或负数表示不限。",
     "type": "float",
     "default": 1.0
   },
   "model_user_quotas_usd": {
     "description": "按模型覆盖每人每日限额（美元）",
-    "hint": "key 为提供商 ID，value 为美元金额，0 表示该模型不限。缺省的模型使用上面的默认值。",
+    "hint": "key 为提供商 ID，value 为美元金额，0 表示该模型不限。优先级高于内置预设。",
     "type": "dict",
     "items": {},
     "default": {}
   },
   "default_user_total_quota_usd": {
     "description": "每人每天全部模型的消费总额度（美元）",
-    "hint": "一个人在所有模型上的当日总花费上限。0 或负数表示不限。",
+    "hint": "一个人在所有模型上的当日总花费上限。默认 2 美元。0 或负数表示不限。",
     "type": "float",
     "default": 2.0
   },
   "default_global_quota_usd": {
-    "description": "全用户每日总限额默认值（美元）",
-    "hint": "所有非管理员用户在单个模型上的共享总花费。0 或负数表示不限。",
+    "description": "每个 bot 每模型的每日总池（美元）",
+    "hint": "同一个 bot 上所有非管理员用户共享。总池按 bot 分开统计：多个 bot 各有一个独立总池，不会合并。默认 1 美元。0 或负数表示不限。",
     "type": "float",
-    "default": 0.0
+    "default": 1.0
   },
   "model_global_quotas_usd": {
-    "description": "按模型覆盖全用户每日总限额（美元）",
-    "hint": "key 为提供商 ID，value 为全用户共享的美元总额，0 表示不限。缺省的模型使用上面的默认值。",
+    "description": "按模型覆盖每 bot 总池（美元）",
+    "hint": "key 为提供商 ID，value 为单个 bot 上全用户共享的美元总额，0 表示不限。",
     "type": "dict",
     "items": {},
     "default": {}
