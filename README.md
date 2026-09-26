@@ -219,7 +219,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |
 | `quota_render` | auto | 个人额度展示：`auto`/`image`（图片卡）/`text` |
-| `admin_exempt` | true | 管理员免限额且不计数（不占总池） |
+| `admin_exempt` | true | 管理员免限额且不计数（不占总池）。**注意**：开启时管理员自己的用量永远是 0 次/¥0.00，卡片和 `/quota` 会显示「管理员免限额，用量不计数」提示；想看到计数请用普通账号，或把此项关掉（管理员也会被限额） |
 | `opencode_only_models` | true | 预设下只展示 OpenCode 提供商的模型 |
 | `opencode_api_base_match` | `opencode.ai` | 判定 OpenCode 提供商的 api_base 关键字 |
 | `unselectable_models` | `[]` | **黑名单**：排除跑不通的模型（填 ID 或模型名即可） |

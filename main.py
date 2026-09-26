@@ -563,6 +563,23 @@ class ModelQuotaPlugin(Star):
             return f"峰时 {self.peak_multiplier:g}×"
         return "谷时 1×"
 
+    def is_exempt(self, event: AstrMessageEvent) -> bool:
+        """该用户是否免限额（管理员 + admin_exempt）。"""
+        try:
+            return bool(self.admin_exempt and event.is_admin())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _exempt_lines(self, event: AstrMessageEvent) -> list[str]:
+        """免限额用户看到的说明，避免把「0 次」误读成统计坏了。"""
+        if not self.is_exempt(event):
+            return []
+        return [
+            "👑 你是管理员：免限额、用量不计数。",
+            "   下面的「已用/已花」只统计普通用户；想看到计数请用普通账号测试，",
+            "   或把插件配置里的 admin_exempt 关掉（那样管理员也会被限额）。",
+        ]
+
     def _all_users_line(self, bot_total: float) -> str:
         """文本版的「全用户总额」行（中等进度条）。"""
         alimit = self.all_users_total_quota
@@ -1912,6 +1929,8 @@ class ModelQuotaPlugin(Star):
         except Exception:
             name = ""
         subtitle = f"个人额度 · 已用百分比（1$≈{self.cny(1)}）"
+        if self.is_exempt(event):
+            subtitle += " · 管理员免限额，用量不计数"
         card = await asyncio.to_thread(
             self._render_quota_card,
             "剩余额度",
@@ -2119,6 +2138,7 @@ class ModelQuotaPlugin(Star):
             if rem_lines:
                 lines.append(f"📊 我今日剩余额度（1$≈{self.cny(1)}）：")
                 lines.extend(rem_lines)
+                lines.extend(self._exempt_lines(event))
                 lines.append(self._total_line(total))
                 lines.append(
                     self._all_users_line(self.bot_total_spent(data, bot))
@@ -2239,6 +2259,7 @@ class ModelQuotaPlugin(Star):
                 counts, spent, gspent_map, gcount_map
             )
             lines.extend(rem_lines if rem_lines else ["当前还没有开放可自选的模型。"])
+            lines.extend(self._exempt_lines(event))
             lines.append(self._total_line(total))
             lines.append(self._all_users_line(self.bot_total_spent(data, bot)))
             lines.append(self._reset_line())
