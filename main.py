@@ -2012,6 +2012,16 @@ class ModelQuotaPlugin(Star):
             ulimit = self.user_model_limit(pid, model)
             sub_left = f"${price:.4f}/次" + self.peak_row_suffix(pid, model)
             sub_left += f" · 已用 {used_n} 次"
+            # 与 /quota 卡一致：有总池的模型带上池条与池用量
+            glimit = self.global_limit(pid, model)
+            pool_pct: float | None = None
+            if glimit > 0:
+                gspent = self._num(gspent_map, pid)
+                pool_pct = min(gspent / glimit * 100.0, 100.0)
+                sub_left += (
+                    f" · 总池已花 {self.cny(gspent)}/{self.cny(glimit)}"
+                    f"（剩 {self.cny(max(glimit - gspent, 0))}）"
+                )
             if ulimit > 0:
                 pct = min(spent_m / ulimit * 100.0, 100.0)
                 rows.append(
@@ -2021,6 +2031,7 @@ class ModelQuotaPlugin(Star):
                         limited=spent_m + price > ulimit + _EPS,
                         sub_left=sub_left,
                         sub_right=f"剩 {self.cny(max(ulimit - spent_m, 0))}",
+                        pool_percent=pool_pct,
                     )
                 )
             else:
@@ -2031,6 +2042,7 @@ class ModelQuotaPlugin(Star):
                         limited=False,
                         sub_left=sub_left,
                         sub_right="",
+                        pool_percent=pool_pct,
                     )
                 )
         return rows
