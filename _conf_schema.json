@@ -182,6 +182,12 @@
     "type": "bool",
     "default": true
   },
+  "group_admins_can_switch": {
+    "description": "允许群管理员（群主/群管理）切换模型与思考强度",
+    "hint": "开启后，在群聊里本群群主与群管理员也能用 /model 切换模型、用 /think 改思考强度，无需是 AstrBot 管理员。仅支持平台能提供群角色时生效：OneBot v11（aiocqhttp）直接读事件里的 sender.role，零额外请求；其他平台回退到群成员列表接口。私聊不受影响（本来谁都能切）。",
+    "type": "bool",
+    "default": false
+  },
   "think_levels": {
     "description": "允许的思考强度级别",
     "hint": "供 /think 校验与提示使用；off 会写成 API 的 none。实际支持的值取决于模型。",

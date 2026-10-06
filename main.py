@@ -148,6 +148,9 @@ QUOTA_PRESET_OPENCODE_GO = "opencode_go"
 _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 """限额预设下未命中月额度表时的总池默认值（美元）。"""
 
+_GROUP_ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
+"""OneBot 11 群成员角色里算「群管理员」的取值（owner=群主，admin=管理员）。"""
+
 _ALL_USERS_TOTAL_DEFAULT = 2.0
 """全用户每日最大总额（本 bot 所有用户合计，美元）。"""
 
@@ -324,6 +327,10 @@ class ModelQuotaPlugin(Star):
         # 思考强度
         self.think_enabled: bool = bool(cfg.get("think_enabled", True))
         self.think_admin_only: bool = bool(cfg.get("think_admin_only", True))
+        # 允许群管理员（群主/群管理，非 Bot 管理员）切换模型与思考强度
+        self.group_admins_can_switch: bool = bool(
+            cfg.get("group_admins_can_switch", False)
+        )
         raw_levels = cfg.get("think_levels", list(THINK_LEVELS))
         levels = (
             [str(x).strip().lower() for x in raw_levels if str(x).strip()]
@@ -562,6 +569,78 @@ class ModelQuotaPlugin(Star):
         if self.is_peak_now(provider_id, model):
             return f"峰时 {self.peak_multiplier:g}×"
         return "谷时 1×"
+
+    @staticmethod
+    def _raw_sender_role(event: AstrMessageEvent) -> str:
+        """从平台原始事件里取发送者的群角色。
+
+        OneBot 11（aiocqhttp）的群消息事件里带 ``sender.role``：
+        ``owner`` / ``admin`` / ``member``。读它不需要额外 API 请求。
+        """
+        try:
+            raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        except Exception:  # noqa: BLE001
+            return ""
+        if raw is None:
+            return ""
+        sender = raw.get("sender") if isinstance(raw, dict) else None
+        if sender is None:
+            getter = getattr(raw, "get", None)
+            if callable(getter):
+                try:
+                    sender = getter("sender")
+                except Exception:  # noqa: BLE001
+                    sender = None
+        if not isinstance(sender, dict):
+            return ""
+        role = sender.get("role")
+        return str(role).strip().lower() if role else ""
+
+    async def is_group_admin(self, event: AstrMessageEvent) -> bool:
+        """发送者是否为该群的群主/群管理员（与 Bot 管理员无关）。
+
+        优先读原始事件的 ``sender.role``（零成本）；拿不到时回退到
+        ``event.get_group()``（会调用平台的群成员列表接口）。
+        """
+        try:
+            if event.is_private_chat():
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+
+        role = self._raw_sender_role(event)
+        if role:
+            return role in _GROUP_ADMIN_ROLES
+
+        # 回退：拉群信息
+        try:
+            group = await event.get_group()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"model_quota: 获取群信息失败，无法判定群管理员: {e}")
+            return False
+        if group is None:
+            return False
+        sender_id = str(event.get_sender_id() or "")
+        if not sender_id:
+            return False
+        owner = str(getattr(group, "group_owner", "") or "")
+        admins = getattr(group, "group_admins", None) or []
+        return sender_id == owner or sender_id in {str(a) for a in admins}
+
+    async def can_manage_models(self, event: AstrMessageEvent) -> bool:
+        """是否有权切换模型 / 修改思考强度。
+
+        Bot 管理员始终可以；开启 ``group_admins_can_switch`` 后，
+        群聊里的群主/群管理员也可以（私聊不受此选项影响，本来谁都能切）。
+        """
+        try:
+            if event.is_admin():
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if not self.group_admins_can_switch:
+            return False
+        return await self.is_group_admin(event)
 
     def is_exempt(self, event: AstrMessageEvent) -> bool:
         """该用户是否免限额（管理员 + admin_exempt）。"""
@@ -1206,10 +1285,15 @@ class ModelQuotaPlugin(Star):
             f"可选：{' / '.join(self.think_levels)} / reset",
             f"用法：/think <级别>（例：/think high），/think reset 清除",
         ]
-        if self.think_admin_only:
-            lines.append("该设置按模型生效（同模型的所有用户共用），仅管理员可改。")
-        else:
+        if not self.think_admin_only:
             lines.append("该设置按模型生效，同模型的所有用户共用。")
+        elif self.group_admins_can_switch:
+            lines.append(
+                "该设置按模型生效（同模型的所有用户共用），"
+                "仅 Bot 管理员或本群群主/群管理员可改。"
+            )
+        else:
+            lines.append("该设置按模型生效（同模型的所有用户共用），仅管理员可改。")
         return "\n".join(lines)
 
     @filter.command("think", alias={"思考", "思考强度"})
@@ -1229,8 +1313,12 @@ class ModelQuotaPlugin(Star):
             current = await self.think_effort_of(pid)
             yield event.plain_result(self._think_help(pid, model, current))
             return
-        if self.think_admin_only and not event.is_admin():
-            yield event.plain_result("❌ 思考强度仅管理员可修改，你可以用 /think 查看当前值。")
+        if self.think_admin_only and not await self.can_manage_models(event):
+            if self.group_admins_can_switch and not event.is_private_chat():
+                hint = "❌ 思考强度仅 Bot 管理员或本群群主/群管理员可修改，你可以用 /think 查看当前值。"
+            else:
+                hint = "❌ 思考强度仅管理员可修改，你可以用 /think 查看当前值。"
+            yield event.plain_result(hint)
             return
         efforts = await self._load_think_efforts()
         disp = self._display_name(pid, model)
@@ -2096,7 +2184,13 @@ class ModelQuotaPlugin(Star):
             "  快捷写法：/model 2 或 /model Kimi K3（名称带空格也能直接写）\n"
             "/quota —— 查看我今日剩余额度（等同原来的 /model me）\n"
             "/think —— 查看或修改当前模型的思考强度\n"
-            "说明：私聊谁都可以切换；群聊里只有管理员能切换。\n"
+            "说明：私聊谁都可以切换；"
+            + (
+                "群聊里 Bot 管理员或本群群主/群管理员可以切换。\n"
+                if self.group_admins_can_switch
+                else "群聊里只有管理员能切换。\n"
+            )
+            +
             "列表与切换只包含管理员开放的模型（selectable_models）。\n"
             "切换按当前会话生效（私聊按人，群聊按整群），消费按人统计。"
         )
@@ -2174,7 +2268,10 @@ class ModelQuotaPlugin(Star):
                 lines.append("")
             lines.append("切换：/model use <序号|名称>（例：/model use 2）")
             if not event.is_private_chat():
-                lines.append("群聊中切换模型仅限管理员。")
+                if self.group_admins_can_switch:
+                    lines.append("群聊中切换模型：Bot 管理员或本群群主/群管理员。")
+                else:
+                    lines.append("群聊中切换模型仅限管理员。")
             yield event.plain_result("\n".join(lines))
             return
 
@@ -2193,11 +2290,16 @@ class ModelQuotaPlugin(Star):
         elif act:
             token = f"{action} {target or ''}".strip()
         if token:
-            # 群聊仅管理员可切换
-            if not event.is_private_chat() and not event.is_admin():
-                yield event.plain_result(
-                    "❌ 群聊中切换模型仅限管理员，你可以用 /model 查看模型和剩余额度。"
-                )
+            # 群聊：Bot 管理员，或（开启选项后）本群群主/群管理员
+            if not event.is_private_chat() and not await self.can_manage_models(event):
+                if self.group_admins_can_switch:
+                    tip = (
+                        "❌ 群聊中切换模型仅限 Bot 管理员或本群群主/群管理员，"
+                        "你可以用 /model 查看模型和剩余额度。"
+                    )
+                else:
+                    tip = "❌ 群聊中切换模型仅限管理员，你可以用 /model 查看模型和剩余额度。"
+                yield event.plain_result(tip)
                 return
             found = self._find_provider(token)
             if found is None:

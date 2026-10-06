@@ -111,8 +111,12 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 顶部是**最粗的「个人总额」**进度条，其下是中等粗细的**「全用户总额」**进度条，
 再下面每行一个模型，带序号、单价、当日已用次数与剩余额度，当前模型标 `*`。
 
-**群聊规则**：群里**只有管理员能切换**模型（AstrBot 管理员判定，`event.is_admin()`）；
-普通群成员可查看列表、可查自己的剩余额度。私聊谁都可以切换。
+**群聊规则**：默认只有 **AstrBot 管理员**能切换模型；开启 `group_admins_can_switch` 后，
+**本群群主/群管理员**（平台角色，不是 Bot 管理员）也能切换。普通群成员始终可以查看列表、查自己的剩余额度。
+私聊谁都可以切换。
+
+> 群管理员判定：OneBot v11（aiocqhttp）直接读群消息事件里的 `sender.role`
+> （`owner` / `admin` / `member`），**零额外请求**；拿不到时回退调用平台的群成员列表接口。
 
 切换按当前会话生效（私聊按人，群聊按整群）；消费按人统计，群里各人分开算。
 
@@ -157,10 +161,30 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 > ⚠️ **按模型生效，不是按人**。AstrBot 的 `reasoning_effort` 只能通过 provider 的
 > `custom_extra_body` 生效（请求级的 kwargs 不会并入 payload），所以插件改的是
 > 「这个模型在当前 bot 上的推理强度」，同模型的所有用户共用。
-> 因此默认 `think_admin_only: true`，仅管理员可改；普通用户仍可用 `/think` 查看当前值。
+
+**谁能改思考强度**（由两个开关共同决定）：
+
+| 身份 | `think_admin_only: true`（默认） | `think_admin_only: false` |
+|---|---|---|
+| Bot 管理员 | ✅ 可改 | ✅ 可改 |
+| 群主 / 群管理员 | ✅ 可改（**需同时开启** `group_admins_can_switch`） | ✅ 可改 |
+| 普通用户 | ❌ 只能 `/think` 查看 | ✅ 可改 |
+
+> 也就是说：**默认情况下普通用户不能改思考强度**，只能查看；群管理员默认也不能，
+> 必须显式开启 `group_admins_can_switch`。
 >
 > 若模型服务里已经手填了 `custom_extra_body.reasoning_effort`，两者会互相覆盖
 > （本插件在每次调用前按当前设置写入）。
+
+## 权限一览
+
+| 操作 | 私聊 | 群聊 |
+|---|---|---|
+| 查看模型列表 / 剩余额度 | 所有人 | 所有人 |
+| **切换模型** | 所有人 | Bot 管理员；开启 `group_admins_can_switch` 后本群群主/群管理员也可 |
+| 查看思考强度 | 所有人 | 所有人 |
+| **修改思考强度** | Bot 管理员；`think_admin_only: false` 时所有人 | Bot 管理员；开启 `group_admins_can_switch` 后本群群主/群管理员也可 |
+| `/quota all`、`/quota usage`、`/quota reset` | 仅 Bot 管理员 | 仅 Bot 管理员 |
 
 ## WebUI 插件页面（模型 · 思考强度 · 额度）
 
@@ -226,6 +250,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `unselectable_models` | `[]` | **黑名单**：排除跑不通的模型（填 ID 或模型名即可） |
 | `think_enabled` | true | 启用 `/think` 思考强度命令 |
 | `think_admin_only` | true | 思考强度仅管理员可改（普通用户仍可查看） |
+| `group_admins_can_switch` | false | **允许群主/群管理员（非 Bot 管理员）切换模型与改思考强度**；仅群聊生效，私聊不受影响 |
 | `think_levels` | `["off","minimal","low","medium","high","max"]` | 允许的级别（`off` 写成 API 的 `none`） |
 | `default_think_effort` | 空 | 留空=不改写 provider，跟随模型服务自身配置 |
 
