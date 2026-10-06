@@ -88,6 +88,30 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | $30 | **$0.50** | Qwen3.8 Flash、Qwen3.7 Max、DeepSeek V4 Flash、Hy4 preview |
 | $15 | **$0.25** | Kimi K3、Qwen3.8 Max、GLM-5.3、MiMo-V2.6-Pro / V2.5-Pro、DeepSeek V4 Pro / V4 Flash Vision Exp、GPT 5.6 / 6 Luna、Grok 4.6 / 4.7 |
 
+### 额度加权（对齐 opencode 的 `costMultiplier`）
+
+opencode 的额度条统计的是**按模型加权后的花费**，不是真实花费：
+`quotaCost = cost × costMultiplier`，官方月额度越小倍数越大 ——
+**$15 档 ×4、$30 档 ×2、$60 档 ×1**。所以只要碰便宜档的模型，
+额度就会跑得比实际花费快。
+
+本插件按同样口径计费（`price_for()` = 原始单价 × 档位倍数）：
+
+| 档位 | 倍数 | 例（原始单价 → 计费额） | 每人每模型限额 | 每日可问次数 |
+|---|---|---|---|---|
+| $15 | **×4** | Kimi K3：$0.0306 → **$0.1224** | $0.25 | **约 2 次** |
+| $30 | **×2** | Qwen3.8 Flash：$0.0011 → **$0.0022** | $0.50 | 约 225 次 |
+| $60 | ×1 | DeepSeek V4.1 Flash：$0.0005 → $0.0005 | 不限（≥个人总额，自动剔除） | 受总额约束 |
+| 免费 | ×1 | Space Bunny Free | 不限 | — |
+
+> ⚠️ 注意：**限额本身不做放大**（按你的选择）。所以 $15 档模型（Kimi K3、
+> GLM-5.3、DeepSeek V4 Pro、Grok 4.6/4.7、GPT 5.6 Luna、Qwen3.8 Max…）
+> 在 $0.25 的每人限额下**每天约只能问 2 次**。需要放宽就调大
+> `model_user_quotas_usd` 里对应模型的限额（或调大 `default_user_total_quota_usd`）。
+>
+> 卡片与列表里显示的单价就是**计费额**，并会标注倍数，例如
+> `$0.1224/次（4× 加权，原始 $0.0306）`。
+
 **无效限额自动剔除**：预设算出的「按模型限额 ≥ 每人总额」或「按模型总池 ≥ 全用户总额」时，
 该条永远不会先触发，插件会把它当作**不限**（而不是显示一个永远达不到的数字）。
 你改了总额度后，这个判断会自动跟着变；显式写在 `model_user_quotas_usd` /

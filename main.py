@@ -171,6 +171,18 @@ _GROUP_ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 _ALL_USERS_TOTAL_DEFAULT = 1.0
 """全用户每日最大总额（本 bot 所有用户合计，美元）。"""
 
+_TIER_MULTIPLIERS: tuple[tuple[float, float], ...] = (
+    (15.0, 4.0),
+    (30.0, 2.0),
+    (60.0, 1.0),
+)
+"""额度计费倍数（对齐 opencode 的 costMultiplier）：
+
+官方月额度越小，每一美元实际花费计入的「额度」越多：
+$15 档 ×4、$30 档 ×2、$60 档 ×1。所以碰便宜档的模型时，
+额度条会跑得比真实花费快。
+"""
+
 _QUOTA_POOL_TIER_MONTHLY = 15.0
 """保留每模型总池的档位：官方月额度 $15。"""
 
@@ -451,21 +463,36 @@ class ModelQuotaPlugin(Star):
             result[str(k)] = f
         return result
 
+    def tier_multiplier(self, provider_id: str, model: str = "") -> float:
+        """该模型的额度计费倍数（对齐 opencode 的 costMultiplier）。
+
+        官方月额度 $15 → ×4、$30 → ×2、$60 → ×1；未命中预设表则不加权。
+        """
+        if self.pricing_preset != PRICING_PRESET_OPENCODE_GO:
+            return 1.0
+        monthly = self._preset_monthly_limit(provider_id, model)
+        if monthly is None or monthly <= 0:
+            return 1.0
+        for threshold, mult in _TIER_MULTIPLIERS:
+            if monthly <= threshold:
+                return mult
+        return 1.0
+
     def price_for(self, provider_id: str, model: str = "") -> float:
-        """当前时段单次调用单价（美元），0 表示免费。
+        """当前时段、单次调用的**计费额**（美元），0 表示免费。
 
         优先级：model_call_prices_usd 显式配置 > 内置预设（按模型名匹配）>
-        default_call_price_usd。峰谷定价在低谷价基础上乘 peak_multiplier。
+        default_call_price_usd。峰谷定价在低谷价基础上乘 peak_multiplier；
+        最后再乘档位倍数（$15档×4、$30档×2、$60档×1），与 opencode 的额度口径一致。
         """
         base = self.base_price_for(provider_id, model)
         if base <= 0:
             return base
+        price = base
         if self.is_peak_now(provider_id, model):
             override = self._peak_price_override(provider_id, model)
-            if override is not None:
-                return override
-            return base * self.peak_multiplier
-        return base
+            price = override if override is not None else base * self.peak_multiplier
+        return price * self.tier_multiplier(provider_id, model)
 
     def base_price_for(self, provider_id: str, model: str = "") -> float:
         """低谷期（基础）单价（美元）。"""
@@ -675,6 +702,25 @@ class ModelQuotaPlugin(Star):
             "   下面的「已用/已花」只统计普通用户；想看到计数请用普通账号测试，",
             "   或把插件配置里的 admin_exempt 关掉（那样管理员也会被限额）。",
         ]
+
+    def tier_multiplier_note(self) -> str:
+        """额度加权口径的说明（仅预设启用且有加权档位时返回）。"""
+        if self.pricing_preset != PRICING_PRESET_OPENCODE_GO:
+            return ""
+        parts = [f"${int(t)}档×{int(m)}" for t, m in _TIER_MULTIPLIERS]
+        return "额度按 opencode 加权计费（" + "、".join(parts) + "）"
+
+    def price_label(self, provider_id: str, model: str = "") -> str:
+        """单价展示：计费额（含档位加权与峰谷），并标注倍数。"""
+        price = self.price_for(provider_id, model)
+        if price <= 0:
+            return "免费"
+        text = f"${price:.4f}/次"
+        mult = self.tier_multiplier(provider_id, model)
+        if mult > 1:
+            base = self.base_price_for(provider_id, model)
+            text += f"（{mult:g}× 加权，原始 ${base:.4f}）"
+        return text
 
     def _all_users_line(self, bot_total: float) -> str:
         """文本版的「全用户总额」行（中等进度条）。"""
@@ -2249,6 +2295,8 @@ class ModelQuotaPlugin(Star):
         except Exception:
             name = ""
         subtitle = f"个人额度 · 已用百分比（1$≈{self.cny(1)}）"
+        if self.tier_multiplier_note():
+            subtitle += f" · {self.tier_multiplier_note()}"
         if self.is_exempt(event):
             subtitle += " · 管理员免限额，用量不计数"
         card = await asyncio.to_thread(
@@ -2316,7 +2364,7 @@ class ModelQuotaPlugin(Star):
                 )
                 continue
             ulimit = self.user_model_limit(pid, model)
-            sub_left = f"${price:.4f}/次" + self.peak_row_suffix(pid, model)
+            sub_left = self.price_label(pid, model) + self.peak_row_suffix(pid, model)
             sub_left += f" · 已用 {used_n} 次"
             # 与 /quota 卡一致：有总池的模型带上池条与池用量
             glimit = self.global_limit(pid, model)
@@ -2463,13 +2511,12 @@ class ModelQuotaPlugin(Star):
                 if base <= 0:
                     fee = "免费"
                 else:
-                    fee = f"${base:.4f}/次"
+                    fee = self.price_label(pid, model)
                     if self.has_peak_pricing(pid, model) and self.peak_enabled:
                         if self.is_peak_now(pid, model):
                             fee += f"，当前峰时 {self.peak_multiplier:g}×"
-                            fee += f"（${base * self.peak_multiplier:.4f}）"
                         else:
-                            fee += f"，谷时；峰时 ${base * self.peak_multiplier:.4f}"
+                            fee += f"，当前谷时"
                 lines.append(f"{i}. {self._display_name(pid, model)} [{fee}]{mark}")
             lines.append("")
             rem_lines = self._remaining_lines(counts, spent, gspent_map, gcount_map)
