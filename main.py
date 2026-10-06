@@ -163,7 +163,7 @@ _QUOTA_POOL_TIER_AMOUNT = 1.0
 _QUOTA_POOL_UNLIMITED = 0.0
 """其余档位不再单设总池：由「全用户总额」统一约束。"""
 
-_QUOTA_PRESET_DEFAULT_TOTAL = 1.5
+_QUOTA_PRESET_DEFAULT_TOTAL = 0.75
 """限额预设下每人每天消费总额度（美元）。"""
 
 
@@ -726,12 +726,19 @@ class ModelQuotaPlugin(Star):
         > default_user_model_quota_usd。
         """
         if provider_id in self.model_user_quotas:
+            # 显式配置始终生效（哪怕大于总额，由用户自己决定）
             return self.model_user_quotas[provider_id]
         if self.quota_preset == QUOTA_PRESET_OPENCODE_GO:
             monthly = self._preset_monthly_limit(provider_id, model)
             if monthly is not None:
                 # 官方月额度 ÷ 60 得到每人每日额度：$60 -> $1，$30 -> $0.5，$15 -> $0.25
-                return monthly / 60.0
+                limit = monthly / 60.0
+                # 按模型限额 ≥ 每人总额时，它永远不会先触发（总额会先拦住），
+                # 属于无效配置，直接当作不限。
+                total = self.default_user_total_quota
+                if total > 0 and limit >= total - _EPS:
+                    return 0.0
+                return limit
         return self.default_user_model_quota
 
     def _preset_monthly_limit(self, provider_id: str, model: str) -> float | None:
@@ -752,11 +759,15 @@ class ModelQuotaPlugin(Star):
         if self.quota_preset == QUOTA_PRESET_OPENCODE_GO:
             monthly = self._preset_monthly_limit(provider_id, model)
             if monthly is not None:
-                # 只有 $15 档保留每模型总池 $1；$30/$60 档的额度远大于
-                # 「全用户总额」，单设总池永远不会触发，交给全用户总额统一约束。
-                if monthly == _QUOTA_POOL_TIER_MONTHLY:
-                    return _QUOTA_POOL_TIER_AMOUNT
-                return _QUOTA_POOL_UNLIMITED
+                # 只有 $15 档保留每模型总池；$30/$60 档的额度远大于「全用户总额」，
+                # 单设总池永远不会触发，交给全用户总额统一约束。
+                if monthly != _QUOTA_POOL_TIER_MONTHLY:
+                    return _QUOTA_POOL_UNLIMITED
+                # 总池 ≥ 全用户总额时同理：它永远不会先触发，视为不限。
+                grand_total = self.all_users_total_quota
+                if grand_total > 0 and _QUOTA_POOL_TIER_AMOUNT >= grand_total - _EPS:
+                    return _QUOTA_POOL_UNLIMITED
+                return _QUOTA_POOL_TIER_AMOUNT
         return self.default_global_quota
 
     def cny(self, usd: float) -> str:

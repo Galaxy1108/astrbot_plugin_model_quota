@@ -124,9 +124,9 @@
   },
   "default_user_total_quota_usd": {
     "description": "每人每天全部模型的消费总额度（美元）",
-    "hint": "一个人在所有模型上的当日总花费上限。默认 1.5 美元。0 或负数表示不限。",
+    "hint": "一个人在所有模型上的当日总花费上限。默认 0.75 美元。0 或负数表示不限。注意：预设里「按模型限额 ≥ 本总额」的档位会被自动视为不限（它永远不会先触发）。",
     "type": "float",
-    "default": 1.5
+    "default": 0.75
   },
   "all_users_total_quota_usd": {
     "description": "全用户每日最大总额（美元，本 bot 所有用户合计）",

@@ -75,22 +75,27 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 | 官方每月额度 | 每人每天额度 | 代表模型 |
 |---|---|---|
-| $60 | **$1.00** | GLM-5.2 / GLM-5.1 / 5.3-Flash、Kimi K2.6 / K2.7 Code、MiniMax M3 / M2.7、LongCat-2.0、Hy3、MiMo-V2.5、**DeepSeek V4.1 Flash**、Qwen3.7 / 3.6 Plus、Muse Spark |
+| $60 | ~~$1.00~~ → **不限**（≥ 个人总额，无效） | GLM-5.2 / GLM-5.1 / 5.3-Flash、Kimi K2.6 / K2.7 Code、MiniMax M3 / M2.7、LongCat-2.0、Hy3、MiMo-V2.5、**DeepSeek V4.1 Flash**、Qwen3.7 / 3.6 Plus、Muse Spark |
 | $30 | **$0.50** | Qwen3.8 Flash、Qwen3.7 Max、DeepSeek V4 Flash、Hy4 preview |
 | $15 | **$0.25** | Kimi K3、Qwen3.8 Max、GLM-5.3、MiMo-V2.6-Pro / V2.5-Pro、DeepSeek V4 Pro / V4 Flash Vision Exp、GPT 5.6 / 6 Luna、Grok 4.6 / 4.7 |
+
+**无效限额自动剔除**：预设算出的「按模型限额 ≥ 每人总额」或「按模型总池 ≥ 全用户总额」时，
+该条永远不会先触发，插件会把它当作**不限**（而不是显示一个永远达不到的数字）。
+你改了总额度后，这个判断会自动跟着变；显式写在 `model_user_quotas_usd` /
+`model_global_quotas_usd` 里的值则始终生效。
 
 另外两条全局规则（与预设同时生效）：
 
 - **每 bot 每模型总池 $1**：只对官方月额度 **$15** 的模型生效（同一个 bot 上所有非管理员用户共享）。
   $30/$60 档的月额度远大于「全用户总额」，单设总池永远不会触发，因此不再单设，
   统一由下面的全用户总额约束；
-- **每人每天消费总额 $1.5**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总；
+- **每人每天消费总额 $0.75**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总；
 - **全用户每日最大总额 $1**（`all_users_total_quota_usd`）：本 bot 上**所有用户、所有模型合计**的上限，
   按 bot 分开统计。总池是按模型分的，这一条是跨模型的整体预算。
 
 > ⚠️ **总池按 bot 分开**：一个 bot 一个独立总池，多个 bot 之间不合并。
 > 你有 7 个 bot，就是 7 个互不影响的池子，各自 $1/模型/天。
-> 个人限额则跨 bot 合并（换 bot 不会重置你的 $1.5 总额度），避免来回切 bot 刷额度。
+> 个人限额则跨 bot 合并（换 bot 不会重置你的 $0.75 总额度），避免来回切 bot 刷额度。
 
 想手改就填 `model_user_quotas_usd` / `model_global_quotas_usd`（优先级高于预设），
 或者把 `quota_preset` 设为 `off` 完全自己填。
@@ -238,7 +243,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `quota_preset` | opencode_go | 内置限额预设：按官方月额度 ÷ 60 得出每人每日额度（$60→$1、$30→$0.5、$15→$0.25）；`off` 只用手填 |
 | `default_user_model_quota_usd` | 1.0 | 未命中预设且未单独配置时的每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
-| `default_user_total_quota_usd` | 1.5 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
+| `default_user_total_quota_usd` | 0.75 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
 | `all_users_total_quota_usd` | 1.0 | **全用户每日最大总额**（本 bot 所有用户 + 所有模型合计，各 bot 独立） |
 | `default_global_quota_usd` | 1.0 | 总池兜底值（预设下仅 $15 档模型有 $1 总池，其余不限）；各 bot 独立；0=不限 |
 | `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
