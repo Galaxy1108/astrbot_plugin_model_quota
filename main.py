@@ -20,6 +20,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import functools
+import inspect
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -147,6 +150,20 @@ QUOTA_PRESET_OPENCODE_GO = "opencode_go"
 
 _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 """限额预设下未命中月额度表时的总池默认值（美元）。"""
+
+_CURRENT_EVENT: contextvars.ContextVar = contextvars.ContextVar(
+    "model_quota_current_event",
+    default=None,
+)
+"""当前正在处理的用户事件。
+
+由 ``on_llm_request`` 写入（钩子与 provider 调用在同一个 task 里，
+与 opencode_go_session 插件同一套做法），provider 包装器读它，
+从而把「每一次真实 LLM 请求」都算到触发它的那个会话/用户头上。
+"""
+
+_WRAP_MARK = "_model_quota_wrapped"
+"""provider 方法包装标记，避免重复包装。"""
 
 _GROUP_ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 """OneBot 11 群成员角色里算「群管理员」的取值（owner=群主，admin=管理员）。"""
@@ -1161,24 +1178,187 @@ class ModelQuotaPlugin(Star):
     # 限额拦截：每次唤起 AI 前触发
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # 计费：按「每一次真实 LLM 请求」计
+    #
+    # AstrBot 的 OnLLMRequestEvent 每条消息只触发一次（在 Agent 启动前），
+    # 工具循环里后续每一步 LLM 请求都不会再触发钩子。所以如果只在钩子里计一次，
+    # 一条消息触发 20 轮工具调用时只会记 1 次，与真实消耗严重不符。
+    #
+    # 因此这里包装每个 provider 的 text_chat / text_chat_stream：
+    # 每一次真实请求都扣费一次；额度中途耗尽则提示并请求中断该 Agent run。
+    # ------------------------------------------------------------------
+
+    def _install_provider_wrappers(self) -> int:
+        """给所有 provider 的 text_chat / text_chat_stream 打包装（幂等）。"""
+        installed = 0
+        for provider in self._all_providers():
+            for name in ("text_chat", "text_chat_stream"):
+                original = getattr(provider, name, None)
+                if original is None or not callable(original):
+                    continue
+                if getattr(original, _WRAP_MARK, False):
+                    continue
+                try:
+                    if inspect.isasyncgenfunction(original):
+                        wrapped = self._make_asyncgen_wrapper(original, provider)
+                    else:
+                        wrapped = self._make_async_wrapper(original, provider)
+                    setattr(wrapped, _WRAP_MARK, True)
+                    setattr(provider, name, wrapped)
+                    installed += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(f"model_quota: 包装 {name} 失败: {e}")
+        if installed:
+            logger.info(f"model_quota: 已为 {installed} 个 provider 方法安装计费包装")
+        return installed
+
+    def _make_async_wrapper(self, original, provider):
+        @functools.wraps(original)
+        async def wrapper(*args, **kwargs):
+            await self._charge_request(provider)
+            return await original(*args, **kwargs)
+
+        return wrapper
+
+    def _make_asyncgen_wrapper(self, original, provider):
+        @functools.wraps(original)
+        async def wrapper(*args, **kwargs):
+            await self._charge_request(provider)
+            async for chunk in original(*args, **kwargs):
+                yield chunk
+
+        return wrapper
+
+    async def _charge_request(self, provider) -> None:
+        """为一次真实 LLM 请求扣费；额度不足则提示并中断当前 run。"""
+        event = _CURRENT_EVENT.get()
+        if event is None:
+            return  # 非消息驱动的调用（插件内部/定时任务）不归属任何会话，不计数
+        try:
+            if event.is_stopped():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            meta = provider.meta()
+        except Exception:  # noqa: BLE001
+            return
+        pid = meta.id
+        model_name = meta.model or ""
+        price = self.price_for(pid, model_name)
+        disp = self._display_name(pid, model_name)
+
+        if self.admin_exempt and event.is_admin():
+            return  # 管理员免限额且不计数
+
+        try:
+            data = await self._load_usage()
+            ukey = self._user_key(event)
+            bot = self._bot_id(event)
+            counts, spent, total = self._personal_totals(data, ukey)
+            gspent, gcount = self._pool_of(data, bot, pid)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 读取用量失败，本次不计数: {e}")
+            return
+
+        used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
+        spent_m = self._num(spent, pid)
+
+        if price > 0:
+            tip = ""
+            ulimit = self.user_model_limit(pid, model_name)
+            if ulimit > 0 and spent_m + price > ulimit + _EPS:
+                tip = self.quota_exceeded_tip.format(
+                    model=disp, used=used_n,
+                    spent=self.cny(spent_m), limit=self.cny(ulimit),
+                )
+            if not tip:
+                tlimit = self.default_user_total_quota
+                if tlimit > 0 and total + price > tlimit + _EPS:
+                    tip = self.total_exceeded_tip.format(
+                        spent=self.cny(total), limit=self.cny(tlimit)
+                    )
+            if not tip:
+                alimit = self.all_users_total_quota
+                if alimit > 0:
+                    btotal = self.bot_total_spent(data, bot)
+                    if btotal + price > alimit + _EPS:
+                        tip = self.all_users_exhausted_tip.format(
+                            spent=self.cny(btotal), limit=self.cny(alimit)
+                        )
+            if not tip:
+                glimit = self.global_limit(pid, model_name)
+                if glimit > 0 and gspent + price > glimit + _EPS:
+                    tip = self.global_exhausted_tip.format(
+                        model=disp, used=gcount,
+                        spent=self.cny(gspent), limit=self.cny(glimit),
+                    )
+            if tip:
+                await self._abort_for_quota(event, tip)
+                return
+
+        # 扣费（免费模型只计次数）
+        try:
+            bucket = self._bot_bucket(data, ukey, bot, event)
+            bcounts: dict = bucket["counts"]
+            bspent: dict = bucket["spent"]
+            bcounts[pid] = (
+                bcounts.get(pid, 0) if isinstance(bcounts.get(pid), int) else 0
+            ) + 1
+            if price > 0:
+                bspent[pid] = round(self._num(bspent, pid) + price, 10)
+            await self._save_usage(data)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 写入用量失败: {e}")
+
+    async def _abort_for_quota(self, event: AstrMessageEvent, tip: str) -> None:
+        """额度耗尽：提示用户并请求中断当前 Agent run（不再继续烧额度）。"""
+        try:
+            await event.send(event.plain_result(tip))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 发送限额提示失败: {e}")
+        try:
+            event.stop_event()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from astrbot.core.utils.active_event_registry import (
+                active_event_registry,
+            )
+
+            active_event_registry.request_agent_stop_all(
+                event.unified_msg_origin, exclude=event
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     @filter.on_llm_request()
     async def check_quota(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        """超限则直接回复提示并终止本次 LLM 请求；否则扣费后放行。"""
+        """Agent 启动前的预处理：记录当前事件、安装计费包装、做一次预检查。
+
+        真正的扣费发生在 provider 包装器里（每次真实 LLM 请求一次）。
+        """
         if event.is_stopped():
             return
+        # 供 provider 包装器归属计费对象（同 task，ContextVar 安全）
+        _CURRENT_EVENT.set(event)
+        # 运行期可能新增 provider，这里补装
+        self._install_provider_wrappers()
+
         try:
             provider = await self.context.get_using_provider_async(
                 umo=event.unified_msg_origin
             )
-        except Exception as e:  # 拿不到提供商则放行，不挡正常对话
-            logger.warning(f"model_quota: 获取当前模型失败，本次不计数: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 获取当前模型失败，跳过预检查: {e}")
             return
         if provider is None:
             return
 
         pid = provider.meta().id
         model_name = provider.meta().model or ""
-        price = self.price_for(pid, model_name)
         disp = self._display_name(pid, model_name)
 
         # 思考强度按模型生效，管理员也照常应用（放在豁免判断之前）
@@ -1187,70 +1367,59 @@ class ModelQuotaPlugin(Star):
         await self._touch_conversation(event)
 
         if self.admin_exempt and event.is_admin():
-            return  # 管理员免限额且不计数
+            return
 
+        # 预检查：已经超了就直接拦下，别白跑一轮（扣费仍由包装器负责）
+        price = self.price_for(pid, model_name)
+        if price <= 0:
+            return
         data = await self._load_usage()
         ukey = self._user_key(event)
         bot = self._bot_id(event)
         counts, spent, total = self._personal_totals(data, ukey)
-        gspent, gcount = self._pool_of(data, bot, pid)
-
         used_n = counts.get(pid, 0) if isinstance(counts.get(pid), int) else 0
         spent_m = self._num(spent, pid)
 
-        if price > 0:
-            ulimit = self.user_model_limit(pid, model_name)
-            if ulimit > 0 and spent_m + price > ulimit + _EPS:
-                tip = self.quota_exceeded_tip.format(
-                    model=disp,
-                    used=used_n,
-                    spent=self.cny(spent_m),
-                    limit=self.cny(ulimit),
-                )
-                await event.send(event.plain_result(tip))
-                event.stop_event()
-                return
-
-            tlimit = self.default_user_total_quota
-            if tlimit > 0 and total + price > tlimit + _EPS:
-                tip = self.total_exceeded_tip.format(
+        ulimit = self.user_model_limit(pid, model_name)
+        if ulimit > 0 and spent_m + price > ulimit + _EPS:
+            await self._abort_for_quota(
+                event,
+                self.quota_exceeded_tip.format(
+                    model=disp, used=used_n,
+                    spent=self.cny(spent_m), limit=self.cny(ulimit),
+                ),
+            )
+            return
+        tlimit = self.default_user_total_quota
+        if tlimit > 0 and total + price > tlimit + _EPS:
+            await self._abort_for_quota(
+                event,
+                self.total_exceeded_tip.format(
                     spent=self.cny(total), limit=self.cny(tlimit)
-                )
-                await event.send(event.plain_result(tip))
-                event.stop_event()
-                return
-
-            alimit = self.all_users_total_quota
-            if alimit > 0:
-                btotal = self.bot_total_spent(data, bot)
-                if btotal + price > alimit + _EPS:
-                    tip = self.all_users_exhausted_tip.format(
+                ),
+            )
+            return
+        alimit = self.all_users_total_quota
+        if alimit > 0:
+            btotal = self.bot_total_spent(data, bot)
+            if btotal + price > alimit + _EPS:
+                await self._abort_for_quota(
+                    event,
+                    self.all_users_exhausted_tip.format(
                         spent=self.cny(btotal), limit=self.cny(alimit)
-                    )
-                    await event.send(event.plain_result(tip))
-                    event.stop_event()
-                    return
-
-            glimit = self.global_limit(pid, model_name)
-            if glimit > 0 and gspent + price > glimit + _EPS:
-                tip = self.global_exhausted_tip.format(
-                    model=disp,
-                    used=gcount,
-                    spent=self.cny(gspent),
-                    limit=self.cny(glimit),
+                    ),
                 )
-                await event.send(event.plain_result(tip))
-                event.stop_event()
                 return
-
-        # 扣费放行（免费模型只计次数）；写入该用户在该 bot 下的桶
-        bucket = self._bot_bucket(data, ukey, bot, event)
-        bcounts: dict = bucket["counts"]
-        bspent: dict = bucket["spent"]
-        bcounts[pid] = (bcounts.get(pid, 0) if isinstance(bcounts.get(pid), int) else 0) + 1
-        if price > 0:
-            bspent[pid] = round(self._num(bspent, pid) + price, 10)
-        await self._save_usage(data)
+        gspent, gcount = self._pool_of(data, bot, pid)
+        glimit = self.global_limit(pid, model_name)
+        if glimit > 0 and gspent + price > glimit + _EPS:
+            await self._abort_for_quota(
+                event,
+                self.global_exhausted_tip.format(
+                    model=disp, used=gcount,
+                    spent=self.cny(gspent), limit=self.cny(glimit),
+                ),
+            )
 
     # ------------------------------------------------------------------
     # 思考强度（reasoning_effort）
@@ -2762,6 +2931,14 @@ class ModelQuotaPlugin(Star):
             except Exception:  # noqa: BLE001
                 continue
         return json_response({"provider_id": provider_id, "level": level})
+
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self) -> None:
+        """AstrBot 加载完成后立刻安装计费包装（不等第一条消息）。"""
+        try:
+            self._install_provider_wrappers()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"model_quota: 安装计费包装失败: {e}")
 
     async def terminate(self):
         """卸载时无需清理外部资源。"""
