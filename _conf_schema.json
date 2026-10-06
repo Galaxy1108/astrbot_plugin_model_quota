@@ -130,9 +130,9 @@
   },
   "all_users_total_quota_usd": {
     "description": "全用户每日最大总额（美元，本 bot 所有用户合计）",
-    "hint": "同一个 bot 上所有非管理员用户、所有模型加起来的上限，默认 2 美元。总池是按模型分的，这一条是跨模型的整体预算。0 或负数表示不限。",
+    "hint": "同一个 bot 上所有非管理员用户、所有模型加起来的上限，默认 1 美元。总池是按模型分的，这一条是跨模型的整体预算。0 或负数表示不限。",
     "type": "float",
-    "default": 2.0
+    "default": 1.0
   },
   "default_global_quota_usd": {
     "description": "每 bot 每模型每日总池默认值（美元，未命中预设时用）",

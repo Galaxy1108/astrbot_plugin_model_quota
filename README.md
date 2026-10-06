@@ -85,7 +85,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
   $30/$60 档的月额度远大于「全用户总额」，单设总池永远不会触发，因此不再单设，
   统一由下面的全用户总额约束；
 - **每人每天消费总额 $1.5**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总；
-- **全用户每日最大总额 $2**（`all_users_total_quota_usd`）：本 bot 上**所有用户、所有模型合计**的上限，
+- **全用户每日最大总额 $1**（`all_users_total_quota_usd`）：本 bot 上**所有用户、所有模型合计**的上限，
   按 bot 分开统计。总池是按模型分的，这一条是跨模型的整体预算。
 
 > ⚠️ **总池按 bot 分开**：一个 bot 一个独立总池，多个 bot 之间不合并。
@@ -239,7 +239,7 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 | `default_user_model_quota_usd` | 1.0 | 未命中预设且未单独配置时的每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
 | `default_user_total_quota_usd` | 1.5 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
-| `all_users_total_quota_usd` | 2.0 | **全用户每日最大总额**（本 bot 所有用户 + 所有模型合计，各 bot 独立） |
+| `all_users_total_quota_usd` | 1.0 | **全用户每日最大总额**（本 bot 所有用户 + 所有模型合计，各 bot 独立） |
 | `default_global_quota_usd` | 1.0 | 总池兜底值（预设下仅 $15 档模型有 $1 总池，其余不限）；各 bot 独立；0=不限 |
 | `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |

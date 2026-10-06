@@ -41,8 +41,8 @@ try:
 except Exception:  # pragma: no cover - 极旧版本回退为普通字符串
     GreedyStr = str  # type: ignore[assignment,misc]
 
-_USAGE_KEY = "daily_usage_v3"
-"""KV 存储中用量数据的键名（v3：按 bot 分池）。"""
+_USAGE_KEY = "daily_usage_v4"
+"""KV 存储中用量数据的键名（v4：按 bot+会话分桶）。"""
 
 _THINK_KEY = "think_efforts_v1"
 """KV 存储中「模型 -> 思考强度」的键名。"""
@@ -151,7 +151,7 @@ _QUOTA_PRESET_DEFAULT_GLOBAL = 1.0
 _GROUP_ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 """OneBot 11 群成员角色里算「群管理员」的取值（owner=群主，admin=管理员）。"""
 
-_ALL_USERS_TOTAL_DEFAULT = 2.0
+_ALL_USERS_TOTAL_DEFAULT = 1.0
 """全用户每日最大总额（本 bot 所有用户合计，美元）。"""
 
 _QUOTA_POOL_TIER_MONTHLY = 15.0
@@ -859,26 +859,44 @@ class ModelQuotaPlugin(Star):
     async def _save_usage(self, data: dict) -> None:
         await self.put_kv_data(_USAGE_KEY, data)
 
+    @staticmethod
+    def _bucket_key(bot: str, umo: str) -> str:
+        """桶键：``bot|umo``。
+
+        同一用户在同一 bot 上可能同时活跃于多个会话（私聊 + 多个群聊），
+        所以必须按「bot + 会话」分别记桶，否则用量会被归到其中一个会话，
+        其余会话在页面上显示为 0。
+        """
+        return f"{bot}|{umo or ''}"
+
     def _bot_bucket(
         self, data: dict, ukey: str, bot: str, event: AstrMessageEvent | None = None
     ) -> dict:
-        """取出（必要时创建）某用户在某 bot 下的用量桶。"""
+        """取出（必要时创建）某用户在某 bot 的某个会话下的用量桶。"""
         records = data["records"]
         per_user = records.get(ukey)
         if not isinstance(per_user, dict):
             per_user = {}
             records[ukey] = per_user
-        bucket = per_user.get(bot)
-        if not isinstance(bucket, dict):
-            bucket = {"name": "", "counts": {}, "spent": {}, "umo": ""}
-            per_user[bot] = bucket
+
+        umo = ""
         if event is not None:
             try:
                 umo = str(event.unified_msg_origin or "")
-                if umo:
-                    bucket["umo"] = umo
             except Exception:
-                pass
+                umo = ""
+        key = self._bucket_key(bot, umo)
+
+        bucket = per_user.get(key)
+        if not isinstance(bucket, dict):
+            bucket = {"name": "", "counts": {}, "spent": {}, "bot": bot, "umo": umo}
+            per_user[key] = bucket
+        # 兼容/自愈：字段补全
+        bucket["bot"] = bot
+        if umo:
+            bucket["umo"] = umo
+        elif not isinstance(bucket.get("umo"), str):
+            bucket["umo"] = ""
         for k in ("counts", "spent"):
             if not isinstance(bucket.get(k), dict):
                 bucket[k] = {}
@@ -890,6 +908,31 @@ class ModelQuotaPlugin(Star):
             except Exception:
                 pass
         return bucket
+
+    @staticmethod
+    def _bucket_bot(bucket: dict) -> str:
+        """从桶里取所属 bot（兼容旧键：``bot|umo`` 里取前缀）。"""
+        bot = bucket.get("bot")
+        if isinstance(bot, str) and bot:
+            return bot
+        return ""
+
+    def _iter_buckets(self, data: dict):
+        """遍历所有桶，产出 (ukey, bucket)。兼容旧的以 bot 为键的结构。"""
+        records = data.get("records", {})
+        if not isinstance(records, dict):
+            return
+        for ukey, per_user in records.items():
+            if not isinstance(per_user, dict):
+                continue
+            for key, bucket in per_user.items():
+                if not isinstance(bucket, dict):
+                    continue
+                if not bucket.get("bot"):
+                    # 旧结构：键就是 bot
+                    bucket = dict(bucket)
+                    bucket["bot"] = str(key).split("|", 1)[0]
+                yield ukey, bucket
 
     def _display_name_of(self, data: dict, ukey: str) -> str:
         """从记录里取该用户的昵称（任一 bot 下有值即可）。"""
@@ -927,14 +970,10 @@ class ModelQuotaPlugin(Star):
         """某个 bot 自己的总池：(该 bot 各模型花费表, 各模型次数表)。"""
         spent: dict[str, float] = {}
         counts: dict[str, int] = {}
-        records = data.get("records", {})
-        if isinstance(records, dict):
-            for per_user in records.values():
-                if not isinstance(per_user, dict):
-                    continue
-                bucket = per_user.get(bot)
-                if not isinstance(bucket, dict):
-                    continue
+        for _ukey, bucket in self._iter_buckets(data):
+            if self._bucket_bot(bucket) != bot:
+                continue
+            if True:
                 bspent = bucket.get("spent", {})
                 if isinstance(bspent, dict):
                     for pid, v in bspent.items():
@@ -1010,10 +1049,10 @@ class ModelQuotaPlugin(Star):
         for per_user in records.values():
             if not isinstance(per_user, dict):
                 continue
-            for b, bucket in per_user.items():
+            for _b, bucket in per_user.items():
                 if not isinstance(bucket, dict):
                     continue
-                if bot is not None and str(b) != bot:
+                if bot is not None and self._bucket_bot(bucket) != bot:
                     continue
                 if str(bucket.get("umo") or "") != umo:
                     continue
@@ -1066,10 +1105,10 @@ class ModelQuotaPlugin(Star):
             if not isinstance(per_user, dict):
                 continue
             touched_user = False
-            for b, bucket in per_user.items():
+            for _b, bucket in per_user.items():
                 if not isinstance(bucket, dict):
                     continue
-                if bot is not None and str(b) != bot:
+                if bot is not None and self._bucket_bot(bucket) != bot:
                     continue
                 if umo is not None and str(bucket.get("umo") or "") != umo:
                     continue
@@ -1101,11 +1140,10 @@ class ModelQuotaPlugin(Star):
     def _active_bots(self, data: dict) -> list[str]:
         """今日有记录的 bot 列表。"""
         bots: set[str] = set()
-        records = data.get("records", {})
-        if isinstance(records, dict):
-            for per_user in records.values():
-                if isinstance(per_user, dict):
-                    bots.update(str(b) for b in per_user)
+        for _ukey, bucket in self._iter_buckets(data):
+            b = self._bucket_bot(bucket)
+            if b:
+                bots.add(b)
         return sorted(bots)
 
     # ------------------------------------------------------------------
