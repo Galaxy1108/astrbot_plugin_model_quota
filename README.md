@@ -82,11 +82,16 @@ MiniMax、MiMo、Hy、LongCat、Muse Spark、Space Bunny Free 等全部在售模
 
 按官方每月额度 ÷ 60 自动得出**每人每天每模型**的额度：
 
-| 官方每月额度 | 每人每天额度 | 代表模型 |
-|---|---|---|
-| $60 | ~~$1.00~~ → **不限**（≥ 个人总额，无效） | GLM-5.2 / GLM-5.1 / 5.3-Flash、Kimi K2.6 / K2.7 Code、MiniMax M3 / M2.7、LongCat-2.0、Hy3、MiMo-V2.5、**DeepSeek V4.1 Flash**、Qwen3.7 / 3.6 Plus、Muse Spark |
-| $30 | **$0.50** | Qwen3.8 Flash、Qwen3.7 Max、DeepSeek V4 Flash、Hy4 preview |
-| $15 | **$0.25** | Kimi K3、Qwen3.8 Max、GLM-5.3、MiMo-V2.6-Pro / V2.5-Pro、DeepSeek V4 Pro / V4 Flash Vision Exp、GPT 5.6 / 6 Luna、Grok 4.6 / 4.7 |
+| 官方每月额度 | 每人每天额度 | 额度倍数 | 模型 |
+|---|---|---|---|
+| $60 | ~~$1.00~~ → **不限**（≥ 个人总额，自动剔除） | ×1 | GLM-5.3-Flash、GLM-5.2、Kimi K2.7 Code、Kimi K2.6、LongCat-2.0、MiMo-V2.6-Flash、MiMo-V2.5、MiniMax M3、MiniMax M2.7、Muse Spark 1.3 / 1.2 Contributor、Qwen3.7 Plus、DeepSeek V4.1 Flash、Hy3 |
+| $30 | **$0.50** | ×2 | Qwen3.8 Flash、DeepSeek V4 Flash、Hy4 preview、**Space Bunny** |
+| $15 | **$0.25** | ×4 | GLM-5.3、Kimi K3、MiMo-V2.6-Pro、MiMo-V2.5-Pro、Qwen3.8 Max、DeepSeek V4 Pro、DeepSeek V4 Flash Vision Exp、Grok 4.7、Grok 4.6、GPT 6 Luna、GPT 5.6 Luna |
+| 无限制（限时免费） | 不限 | ×1 | LongCat 2.5 Preview Free |
+
+> 上表按 [OpenCode Go 官方文档](https://opencode.ai/docs/zh-cn/go/) 的「每月限制」与「预估请求数」两张表生成，
+> 已逐项核对（30 个在售模型全部一致）。文档中已下架的历史模型（GLM-5.1、Qwen3.7 Max、
+> Qwen3.6 Plus、MiniMax M2.5）仍保留在表内，以便旧配置继续正确计价。
 
 ### 额度加权（对齐 opencode 的 `costMultiplier`）
 
@@ -102,7 +107,7 @@ opencode 的额度条统计的是**按模型加权后的花费**，不是真实�
 | $15 | **×4** | Kimi K3：$0.0306 → **$0.1224** | $0.25 | **约 2 次** |
 | $30 | **×2** | Qwen3.8 Flash：$0.0011 → **$0.0022** | $0.50 | 约 225 次 |
 | $60 | ×1 | DeepSeek V4.1 Flash：$0.0005 → $0.0005 | 不限（≥个人总额，自动剔除） | 受总额约束 |
-| 免费 | ×1 | Space Bunny Free | 不限 | — |
+| 免费 | ×1 | LongCat 2.5 Preview Free（限时） | 不限 | — |
 
 > ⚠️ 注意：**限额本身不做放大**（按你的选择）。所以 $15 档模型（Kimi K3、
 > GLM-5.3、DeepSeek V4 Pro、Grok 4.6/4.7、GPT 5.6 Luna、Qwen3.8 Max…）

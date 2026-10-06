@@ -113,7 +113,11 @@ _OPENCODE_GO_PRICES: dict[str, float] = {
     "grok-4.6": 15 / 845,
     "gpt-6-luna": 15 / 21130,
     "gpt-5.6-luna": 15 / 10250,
-    "space-bunny-free": 0.0,
+    # Space Bunny：官方文档为 $30 档（旧版曾标注为免费，已按文档更正）
+    "space-bunny": 30 / 15630,
+    "space-bunny-free": 30 / 15630,  # 旧模型名兼容
+    # LongCat 2.5 Preview Free：官方文档标注「无限制 · 限时免费」
+    "longcat-2.5-preview-free": 0.0,
 }
 """模型名（规范化后）-> 低谷期单次调用单价（美元）。"""
 
@@ -138,7 +142,10 @@ _OPENCODE_GO_MONTHLY_LIMITS: dict[str, float] = {
     "deepseek-v4.1-flash": 60, "deepseek-v4-pro": 15, "deepseek-v4-flash": 30,
     "deepseek-v4-flash-vision-exp": 15, "hy4-preview": 30, "hy3": 60,
     "grok-4.7": 15, "grok-4.6": 15, "gpt-6-luna": 15, "gpt-5.6-luna": 15,
-    "space-bunny-free": 0,
+    "space-bunny": 30, "space-bunny-free": 30,
+    "longcat-2.5-preview-free": 0,
+    # —— 以下模型已不在官方文档的当前列表里，保留以便旧配置仍能正确计价 ——
+    "glm-5.1": 60, "qwen3.7-max": 30, "qwen3.6-plus": 60, "minimax-m2.5": 60,
 }
 """OpenCode Go 各模型的每月额度（美元），用于文档与月→日换算参考。"""
 
