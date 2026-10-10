@@ -9,7 +9,7 @@ desc: >-
   （单价自动换算、峰谷定价、每人每日额度按官方月额度 ÷60），每人每天另有消费总额度，
   管理员默认免限额且不计数。超限自动拦截并提示。另提供 /think 思考强度调整，
   以及 WebUI 插件页面查看每个对话的模型 / 思考强度 / 额度并可按模型重置用量。
-version: 1.15.0
+version: 1.16.0
 author: Galaxy1108
 repo: https://github.com/Galaxy1108/astrbot_plugin_model_quota
 astrbot_version: ">=4.5.7"

@@ -127,13 +127,13 @@ opencode 的额度条统计的是**按模型加权后的花费**，不是真实�
 - **每 bot 每模型总池 $1**：只对官方月额度 **$15** 的模型生效（同一个 bot 上所有非管理员用户共享）。
   $30/$60 档的月额度远大于「全用户总额」，单设总池永远不会触发，因此不再单设，
   统一由下面的全用户总额约束；
-- **每人每天消费总额 $0.75**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总；
-- **全用户每日最大总额 $1**（`all_users_total_quota_usd`）：本 bot 上**所有用户、所有模型合计**的上限，
+- **每人每天消费总额 $0.25**（`default_user_total_quota_usd`）：跨模型、跨 bot 汇总；
+- **全用户每日最大总额 $0.25**（`all_users_total_quota_usd`）：本 bot 上**所有用户、所有模型合计**的上限，
   按 bot 分开统计。总池是按模型分的，这一条是跨模型的整体预算。
 
 > ⚠️ **总池按 bot 分开**：一个 bot 一个独立总池，多个 bot 之间不合并。
 > 你有 7 个 bot，就是 7 个互不影响的池子，各自 $1/模型/天。
-> 个人限额则跨 bot 合并（换 bot 不会重置你的 $0.75 总额度），避免来回切 bot 刷额度。
+> 个人限额则跨 bot 合并（换 bot 不会重置你的 $0.25 总额度），避免来回切 bot 刷额度。
 
 想手改就填 `model_user_quotas_usd` / `model_global_quotas_usd`（优先级高于预设），
 或者把 `quota_preset` 设为 `off` 完全自己填。
@@ -281,8 +281,8 @@ opencode 的额度条统计的是**按模型加权后的花费**，不是真实�
 | `quota_preset` | opencode_go | 内置限额预设：按官方月额度 ÷ 60 得出每人每日额度（$60→$1、$30→$0.5、$15→$0.25）；`off` 只用手填 |
 | `default_user_model_quota_usd` | 1.0 | 未命中预设且未单独配置时的每人每天每模型默认限额 |
 | `model_user_quotas_usd` | `{}` | 按模型覆盖个人限额，例 `{"vip": 5.0}` |
-| `default_user_total_quota_usd` | 0.75 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
-| `all_users_total_quota_usd` | 1.0 | **全用户每日最大总额**（本 bot 所有用户 + 所有模型合计，各 bot 独立） |
+| `default_user_total_quota_usd` | 0.25 | **每人每天全部模型消费总额度**（跨 bot 汇总） |
+| `all_users_total_quota_usd` | 0.25 | **全用户每日最大总额**（本 bot 所有用户 + 所有模型合计，各 bot 独立） |
 | `default_global_quota_usd` | 1.0 | 总池兜底值（预设下仅 $15 档模型有 $1 总池，其余不限）；各 bot 独立；0=不限 |
 | `model_global_quotas_usd` | `{}` | 按模型覆盖总池（单 bot），例 `{"vip": 100.0}` |
 | `usd_to_cny_rate` | 7.2 | 汇率，只影响展示 |

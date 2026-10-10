@@ -175,7 +175,7 @@ _WRAP_MARK = "_model_quota_wrapped"
 _GROUP_ADMIN_ROLES: frozenset[str] = frozenset({"owner", "admin"})
 """OneBot 11 群成员角色里算「群管理员」的取值（owner=群主，admin=管理员）。"""
 
-_ALL_USERS_TOTAL_DEFAULT = 1.0
+_ALL_USERS_TOTAL_DEFAULT = 0.25
 """全用户每日最大总额（本 bot 所有用户合计，美元）。"""
 
 _TIER_MULTIPLIERS: tuple[tuple[float, float], ...] = (
@@ -199,7 +199,7 @@ _QUOTA_POOL_TIER_AMOUNT = 1.0
 _QUOTA_POOL_UNLIMITED = 0.0
 """其余档位不再单设总池：由「全用户总额」统一约束。"""
 
-_QUOTA_PRESET_DEFAULT_TOTAL = 0.75
+_QUOTA_PRESET_DEFAULT_TOTAL = 0.25
 """限额预设下每人每天消费总额度（美元）。"""
 
 
